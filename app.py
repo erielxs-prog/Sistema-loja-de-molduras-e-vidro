@@ -1,5 +1,5 @@
 """
-Sistema de Gestão - CIR Molduras
+Sistema de Gestão -
 (clientes, orçamentos configuráveis, produtos/estoque, vendas e agenda)
 
 Instalar:   pip install flask
@@ -25,7 +25,7 @@ from flask import (Flask, abort, flash, g, jsonify, redirect, render_template,
                    request, send_file, url_for)
 from jinja2 import DictLoader
 
-NOME_EMPRESA = "CIR Molduras"
+NOME_EMPRESA = ""
 # Rodando como .exe (PyInstaller) o __file__ aponta para uma pasta temporária: os dados ficam ao lado do .exe.
 PASTA = os.path.dirname(sys.executable) if getattr(sys, "frozen", False) else os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.path.join(PASTA, "gestao.db")
