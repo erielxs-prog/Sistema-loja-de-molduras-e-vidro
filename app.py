@@ -1,5 +1,5 @@
 """
-Sistema de Gestão -
+Sistema de Gestão - CIR Molduras
 (clientes, orçamentos configuráveis, produtos/estoque, vendas e agenda)
 
 Instalar:   pip install flask
@@ -22,16 +22,18 @@ from datetime import datetime
 from decimal import Decimal, ROUND_CEILING, ROUND_HALF_UP, InvalidOperation
 
 from flask import (Flask, abort, flash, g, jsonify, redirect, render_template,
-                   request, send_file, url_for)
+                   request, send_file, session, url_for)
 from jinja2 import DictLoader
+from werkzeug.security import check_password_hash, generate_password_hash
 
-NOME_EMPRESA = ""
+NOME_EMPRESA = "CIR Molduras"
 # Rodando como .exe (PyInstaller) o __file__ aponta para uma pasta temporária: os dados ficam ao lado do .exe.
 PASTA = os.path.dirname(sys.executable) if getattr(sys, "frozen", False) else os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.path.join(PASTA, "gestao.db")
 
 UNIDADES = {"un": "un", "m2": "m²", "ml": "ML"}           # código -> rótulo curto
 ORC = {  # status do orçamento -> (rótulo, cor)
+    "orcamento": ("Orçamento", ""),
     "aberto": ("Em aberto", "wa"),
     "aprovado": ("Aprovado", "ok"),
     "producao": ("Em produção", "wa"),
@@ -41,7 +43,9 @@ ORC = {  # status do orçamento -> (rótulo, cor)
 
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 4 * 1024 * 1024
-app.secret_key = os.urandom(24)
+app.secret_key = os.urandom(24)           # trocada por uma chave fixa guardada no banco (carregar_segredo)
+from datetime import timedelta
+app.permanent_session_lifetime = timedelta(days=30)
 
 
 # ------------------------------ Banco de dados ---------------------------
@@ -139,6 +143,11 @@ CREATE TABLE IF NOT EXISTS lancamentos(
   categoria_id INTEGER, valor INTEGER NOT NULL, data TEXT NOT NULL, vencimento TEXT,
   pagamento TEXT, status TEXT NOT NULL DEFAULT 'pendente', obs TEXT, criado_em TEXT,
   FOREIGN KEY(categoria_id) REFERENCES fin_categorias(id));
+CREATE TABLE IF NOT EXISTS pagamentos(
+  id INTEGER PRIMARY KEY AUTOINCREMENT, orcamento_id INTEGER NOT NULL, valor INTEGER NOT NULL,
+  data TEXT NOT NULL, forma TEXT, obs TEXT, criado_em TEXT,
+  FOREIGN KEY(orcamento_id) REFERENCES orcamentos(id));
+CREATE INDEX IF NOT EXISTS idx_pag_orc ON pagamentos(orcamento_id);
 CREATE TABLE IF NOT EXISTS venda_custos(
   id INTEGER PRIMARY KEY AUTOINCREMENT, venda_id INTEGER NOT NULL, produto_id INTEGER,
   descricao TEXT, qtd REAL, custo_unit INTEGER, subtotal INTEGER,
@@ -216,6 +225,8 @@ def migrar_cadastros(con):
     con.execute("CREATE TABLE IF NOT EXISTS categorias_produto(id INTEGER PRIMARY KEY AUTOINCREMENT, "
                 "nome TEXT NOT NULL, ativo INTEGER NOT NULL DEFAULT 1)")
     con.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_catprod_nome ON categorias_produto(lower(trim(nome)))")
+    if "unidade" not in {r[1] for r in con.execute("PRAGMA table_info(categorias_produto)")}:
+        con.execute("ALTER TABLE categorias_produto ADD COLUMN unidade TEXT NOT NULL DEFAULT 'un'")
     if "categoria_id" not in {r[1] for r in con.execute("PRAGMA table_info(produtos)")}:
         con.execute("ALTER TABLE produtos ADD COLUMN categoria_id INTEGER REFERENCES categorias_produto(id)")
     # produtos com categoria em texto, ainda sem vínculo: cria/reutiliza a categoria equivalente
@@ -241,6 +252,12 @@ def migrar_cadastros(con):
         con.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_prod_sku ON produtos(lower(trim(sku))) "
                     "WHERE trim(COALESCE(sku,''))<>''")
     # telefone único (forma normalizada)
+    ccols = {r[1] for r in con.execute("PRAGMA table_info(clientes)")}
+    for col in ("documento", "documento_norm"):
+        if col not in ccols:
+            con.execute(f"ALTER TABLE clientes ADD COLUMN {col} TEXT")
+    con.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_cli_doc ON clientes(documento_norm) "
+                "WHERE documento_norm IS NOT NULL AND documento_norm<>''")
     if "telefone_norm" not in {r[1] for r in con.execute("PRAGMA table_info(clientes)")}:
         con.execute("ALTER TABLE clientes ADD COLUMN telefone_norm TEXT")
     for cid, tel in con.execute("SELECT id, telefone FROM clientes WHERE telefone_norm IS NULL "
@@ -297,6 +314,9 @@ def iniciar_db():
         con.execute("ALTER TABLE orcamentos ADD COLUMN estoque_baixado INTEGER NOT NULL DEFAULT 0")
     if "token" not in ocols:
         con.execute("ALTER TABLE orcamentos ADD COLUMN token TEXT")
+    for col, tipo in (("followup_em", "TEXT"), ("followup_off", "INTEGER NOT NULL DEFAULT 0")):
+        if col not in ocols:
+            con.execute(f"ALTER TABLE orcamentos ADD COLUMN {col} {tipo}")
     con.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_orc_token ON orcamentos(token) "
                 "WHERE token IS NOT NULL")
     ccols = {r[1] for r in con.execute("PRAGMA table_info(clientes)")}
@@ -336,6 +356,8 @@ def iniciar_db():
         if col not in ocols:
             con.execute(f"ALTER TABLE orcamentos ADD COLUMN {col} {tipo}")
     con.execute("CREATE TABLE IF NOT EXISTS config(chave TEXT PRIMARY KEY, valor TEXT)")
+    if "pronto_enviado_em" not in {r[1] for r in con.execute("PRAGMA table_info(orcamentos)")}:
+        con.execute("ALTER TABLE orcamentos ADD COLUMN pronto_enviado_em TEXT")
     vcols = {r[1] for r in con.execute("PRAGMA table_info(vendas)")}
     for col, tipo in (("orcamento_id", "INTEGER"), ("valor_bruto", "INTEGER"),
                       ("desconto", "INTEGER"), ("cpv", "INTEGER"),
@@ -346,6 +368,24 @@ def iniciar_db():
                 "WHERE orcamento_id IS NOT NULL")
     con.executescript(FIN_SCHEMA)
     con.executescript(EMPRESA_SCHEMA)
+    con.execute("""CREATE TABLE IF NOT EXISTS mkt_resumo(id INTEGER PRIMARY KEY, loja TEXT NOT NULL, plataforma TEXT,
+        ini TEXT NOT NULL, fim TEXT NOT NULL, pedidos INTEGER, valor INTEGER, validos INTEGER, valor_validos INTEGER,
+        cancelados INTEGER, valor_cancelados INTEGER, clientes INTEGER, importado_em TEXT, UNIQUE(loja, ini, fim))""")
+    con.executescript("""
+CREATE TABLE IF NOT EXISTS mkt_produtos(id INTEGER PRIMARY KEY, ini TEXT NOT NULL, fim TEXT NOT NULL, produto TEXT, loja TEXT,
+  sku TEXT, anuncio TEXT, pedidos INTEGER, unidades INTEGER, valor INTEGER, importado_em TEXT);
+CREATE INDEX IF NOT EXISTS idx_mktprod_per ON mkt_produtos(ini, fim);
+CREATE TABLE IF NOT EXISTS mkt_variantes(id INTEGER PRIMARY KEY, ini TEXT NOT NULL, fim TEXT NOT NULL, produto TEXT, loja TEXT,
+  sku TEXT, variante TEXT, variante_id TEXT, sku_principal TEXT, anuncio TEXT, pedidos INTEGER, unidades INTEGER, valor INTEGER, importado_em TEXT);
+CREATE INDEX IF NOT EXISTS idx_mktvar_per ON mkt_variantes(ini, fim);
+CREATE TABLE IF NOT EXISTS mkt_diario(data TEXT PRIMARY KEY, pedidos INTEGER, valor INTEGER, validos INTEGER, valor_validos INTEGER,
+  cancelados INTEGER, valor_cancelados INTEGER, clientes INTEGER, importado_em TEXT);
+CREATE TABLE IF NOT EXISTS mkt_catalogo(produto_id TEXT PRIMARY KEY, sku TEXT, nome TEXT);
+CREATE TABLE IF NOT EXISTS mkt_vinculos(origem TEXT PRIMARY KEY, grupo TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS mkt_ignorados(chave TEXT PRIMARY KEY);
+CREATE TABLE IF NOT EXISTS mkt_custos(chave TEXT PRIMARY KEY, custo INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS mkt_taxas(loja TEXT PRIMARY KEY, comissao INTEGER NOT NULL DEFAULT 0, imposto INTEGER NOT NULL DEFAULT 0);
+""")
     migrou_bancos = con.execute("SELECT 1 FROM sqlite_master WHERE name='banco_categorias'").fetchone()
     con.executescript(EXTRATO_SCHEMA)
     if "extrato_linha_id" not in {r[1] for r in con.execute("PRAGMA table_info(lancamentos)")}:
@@ -594,7 +634,11 @@ def contexto():
         emp = empresa_dados(get_db())
     except sqlite3.Error:
         emp = {"nome": NOME_EMPRESA, "vendedor": "", "tem_logo": False}
-    return {"empresa": emp["nome"], "emp": emp, "ORC": ORC}
+    try:
+        tem_senha = bool(_senha_hash(get_db()))
+    except sqlite3.Error:
+        tem_senha = False
+    return {"empresa": emp["nome"], "emp": emp, "ORC": ORC, "tem_senha": tem_senha}
 
 
 # -------------------------------- Financeiro -----------------------------
@@ -650,11 +694,16 @@ def dre_periodo(db, px):
     pend_desp = sum(x[1] for k, x in l.items() if k[0] == "despesa" and k[1] in ("operacional", "outras"))
     # caixa realizado (nada de data inventada: só entra o que foi marcado como recebido/pago)
     caixa = db.execute(
-        "SELECT (SELECT COALESCE(SUM(total),0) FROM vendas WHERE status='ativa' AND substr(recebido_em,1,?)=?) vendas, "
+        "SELECT (SELECT COALESCE(SUM(valor),0) FROM pagamentos WHERE substr(data,1,?)=?) + "
+        "(SELECT COALESCE(SUM(total),0) FROM vendas v WHERE v.status='ativa' AND substr(v.recebido_em,1,?)=? "
+        "AND NOT EXISTS (SELECT 1 FROM pagamentos p WHERE p.orcamento_id=v.orcamento_id)) vendas, "
         "(SELECT COALESCE(SUM(valor),0) FROM lancamentos WHERE tipo='receita' AND status='recebido' AND substr(pagamento,1,?)=?) rec, "
         "(SELECT COALESCE(SUM(valor),0) FROM lancamentos WHERE tipo='despesa' AND status='pago' AND substr(pagamento,1,?)=?) desp, "
-        "(SELECT COALESCE(SUM(total),0) FROM vendas WHERE status='ativa' AND recebido_em IS NULL AND substr(data,1,?)=?) areceber",
-        (n, px) * 4).fetchone()
+        "(SELECT COALESCE(SUM(CASE WHEN p.pago IS NOT NULL THEN MAX(v.total - p.pago, 0) "
+        "WHEN v.recebido_em IS NULL THEN v.total ELSE 0 END),0) FROM vendas v LEFT JOIN "
+        "(SELECT orcamento_id, SUM(valor) pago FROM pagamentos GROUP BY orcamento_id) p ON p.orcamento_id=v.orcamento_id "
+        "WHERE v.status='ativa' AND substr(v.data,1,?)=?) areceber",
+        (n, px) * 5).fetchone()
     return {
         "vendas_qtd": v["n"], "vendas_liq": v["liq"], "receita_bruta": v["bruto"],
         "descontos": v["desc_"], "deducoes": deducoes, "receita_liquida": receita_liq,
@@ -773,6 +822,28 @@ def api_lancamentos():
                            "pagamento": r["recebido_em"]})
     linhas.sort(key=lambda x: (x["data"], x["id"]), reverse=True)
     return jsonify(linhas=linhas)
+
+
+@app.route("/api/financeiro/lancamentos/<int:lid>/baixa", methods=["POST"])
+def api_lancamento_baixa(lid):
+    db = get_db()
+    r = db.execute("SELECT * FROM lancamentos WHERE id=?", (lid,)).fetchone()
+    if not r:
+        return jsonify(ok=False, erros=["Lançamento não encontrado."]), 404
+    dados = request.get_json(silent=True) or {}
+    if dados.get("desfazer"):
+        db.execute("UPDATE lancamentos SET status='pendente', pagamento=NULL WHERE id=?", (lid,))
+        db.commit()
+        return jsonify(ok=True)
+    data = str(dados.get("data", ""))
+    try:
+        datetime.strptime(data, "%Y-%m-%d")
+    except ValueError:
+        return jsonify(ok=False, erros=["Data inválida."]), 400
+    db.execute("UPDATE lancamentos SET status=?, pagamento=? WHERE id=?",
+               ("pago" if r["tipo"] == "despesa" else "recebido", data, lid))
+    db.commit()
+    return jsonify(ok=True)
 
 
 @app.route("/api/financeiro/lancamentos/<int:lid>", methods=["PUT", "DELETE"])
@@ -1357,13 +1428,25 @@ def bancos():
     sub_sai = sum(m["valor"] for m in movs if m["acao"] == "despesa")
     lista_bancos = [r[0] for r in db.execute("SELECT DISTINCT banco FROM extratos ORDER BY banco")]
     saldos = saldos_do_mes(db, ano, mes, banco) if mes else []
+    comparativo = []
+    for m in range(1, 13):
+        pm = periodo(ano, m)
+        d = dre_periodo(db, pm)
+        b = db.execute("SELECT COALESCE(SUM(CASE WHEN l.acao='receita' THEN l.valor END),0) ent, COUNT(*) n "
+                       "FROM extrato_linhas l JOIN extratos e ON e.id=l.extrato_id WHERE l.aplicado=1 "
+                       "AND l.acao IN ('receita','despesa') AND substr(l.data,1,7)=?" + (" AND e.banco=?" if banco else ""),
+                       (pm, banco) if banco else (pm,)).fetchone()
+        if d["vendas_qtd"] or d["caixa"]["vendas_recebidas"] or b["n"]:
+            comparativo.append({"mes": m, "vendas": d["vendas_liq"], "recebido": d["caixa"]["vendas_recebidas"],
+                                "areceber": d["caixa"]["vendas_a_receber"], "banco": b["ent"],
+                                "dif": b["ent"] - d["caixa"]["vendas_recebidas"], "tem_banco": b["n"] > 0})
     extratos = db.execute("SELECT e.*, (SELECT COUNT(*) FROM extrato_linhas l WHERE l.extrato_id=e.id AND l.aplicado=1) ok, "
                           "(SELECT COUNT(*) FROM extrato_linhas l WHERE l.extrato_id=e.id AND l.aplicado=0 "
                           "AND l.acao NOT IN ('duplicada','retido')) pend FROM extratos e ORDER BY e.id DESC LIMIT 12").fetchall()
     return render_template("bancos.html", titulo="Bancos", ano=ano, mes=mes, meses=MESES, banco=banco, tot=tot,
                            por_banco=por_banco, por_cat=por_cat, movs=movs, cat_f=cat_f, cat_nome=cat_nome,
                            sub_ent=sub_ent, sub_sai=sub_sai, lista_bancos=lista_bancos,
-                           extratos=extratos, contraparte=contraparte, saldos=saldos,
+                           extratos=extratos, contraparte=contraparte, saldos=saldos, comparativo=comparativo,
                            mes_ant=_mes_anterior(ano, mes) if mes else "", mes_seg=_mes_seguinte(ano, mes) if mes else "")
 
 
@@ -1602,12 +1685,12 @@ def dashboard():
     v = db.execute("SELECT COALESCE(SUM(total),0) t, COUNT(*) n FROM vendas "
                    "WHERE status='ativa' AND substr(data,1,7)=?", (mes,)).fetchone()
     ab = db.execute("SELECT COUNT(*) n, COALESCE(SUM(total),0) t FROM orcamentos "
-                    "WHERE status='aberto'").fetchone()
+                    "WHERE status='orcamento'").fetchone()
     ap = db.execute("SELECT COUNT(*) n, COALESCE(SUM(total),0) t FROM orcamentos "
                     "WHERE status IN ('aprovado','producao','concluido') AND substr(aprovado_em,1,7)=?",
                     (mes,)).fetchone()
     abertos = db.execute("SELECT o.*, c.nome cliente FROM orcamentos o JOIN clientes c "
-                         "ON c.id=o.cliente_id WHERE o.status='aberto' "
+                         "ON c.id=o.cliente_id WHERE o.status='orcamento' "
                          "ORDER BY o.id DESC LIMIT 6").fetchall()
     agora = datetime.now().strftime("%Y-%m-%dT%H:%M")
     baixo = db.execute("SELECT * FROM produtos WHERE ativo=1 AND servico=0 "
@@ -1622,9 +1705,1184 @@ def dashboard():
     n_clientes = db.execute("SELECT COUNT(*) FROM clientes").fetchone()[0]
     investido = db.execute("SELECT COALESCE(SUM(custo * CASE WHEN estoque>0 THEN estoque ELSE 0 END),0) "
                            "FROM produtos WHERE ativo=1 AND servico=0").fetchone()[0]
-    return render_template("dashboard.html", titulo="Início", v=v, ab=ab, ap=ap, investido=investido,
+    contas_ini = [r for t in ("despesa", "receita") for r in _contas_pendentes(db, t)
+                  if r["dias"] is not None and r["dias"] <= 7]
+    contas_ini.sort(key=lambda r: (r["dias"], r["tipo"]))
+    contas_tot = {t: sum(r["valor"] for r in contas_ini if r["tipo"] == t) for t in ("despesa", "receita")}
+    return render_template("dashboard.html", titulo="Início", contas_ini=contas_ini[:10],
+                           contas_mais=max(0, len(contas_ini) - 10), contas_tot=contas_tot,
+                           hoje_iso=datetime.now().strftime("%Y-%m-%d"), v=v, ab=ab, ap=ap, investido=investido,
                            abertos=abertos, baixo=baixo, prox=prox, ultimas=ultimas,
-                           n_clientes=n_clientes, atrasados=atrasados)
+                           n_clientes=n_clientes, atrasados=atrasados, avisos=avisos_inicio(db),
+                           aviso_backup=estado_backup(db)["aviso"])
+
+
+MSG_PRONTO_PADRAO = ("Olá, {nome}! Aqui é da {empresa}. Seu pedido (nº {os}) está pronto para retirada. 😊\n"
+                     "{saldo}\n\nTe esperamos!")
+
+
+def _ent_dias(entrega, hoje):
+    try:
+        return (datetime.strptime(entrega, "%Y-%m-%d").date() - hoje).days if entrega else None
+    except ValueError:
+        return None
+
+
+@app.route("/entregas")
+def entregas():
+    db = get_db()
+    hoje = datetime.now().date()
+    rows = []
+    for o in db.execute("SELECT o.id, o.titulo, o.entrega, o.status, o.pronto_enviado_em, o.total, c.nome cliente, "
+                        "c.telefone FROM orcamentos o JOIN clientes c ON c.id=o.cliente_id "
+                        "WHERE o.status IN ('aprovado','producao') ORDER BY o.id"):
+        r = dict(o)
+        r["dias"] = _ent_dias(o["entrega"], hoje)
+        r["saldo"] = resumo_pagamentos(db, o["id"])["saldo"]
+        r["num"] = numero_whatsapp(o["telefone"])
+        rows.append(r)
+    rows.sort(key=lambda r: (r["dias"] is None, r["dias"] if r["dias"] is not None else 0, r["id"]))
+    return render_template("entregas.html", titulo="Entregas", rows=rows,
+                           modelo=cfg_get(db, "pronto_msg", "") or MSG_PRONTO_PADRAO)
+
+
+@app.route("/entregas/config", methods=["POST"])
+def pronto_config():
+    db = get_db()
+    msg = request.form.get("msg", "").replace("\r", "").strip()
+    if len(msg) > 600:
+        flash("A mensagem passa de 600 caracteres.", "erro")
+    else:
+        cfg_set(db, "pronto_msg", "" if msg == MSG_PRONTO_PADRAO else msg); db.commit()
+        flash("Mensagem salva.", "ok")
+    return redirect(url_for("entregas"))
+
+
+@app.route("/entregas/<int:oid>/avisar", methods=["POST"])
+def pronto_enviar(oid):
+    """Marca o aviso como enviado e abre o WhatsApp com a mensagem de 'pronto para retirada'."""
+    db = get_db()
+    o = db.execute("SELECT o.*, c.nome cliente, c.telefone FROM orcamentos o JOIN clientes c ON c.id=o.cliente_id "
+                   "WHERE o.id=? AND o.status IN ('aprovado','producao','concluido')", (oid,)).fetchone()
+    if not o:
+        abort(404)
+    num = numero_whatsapp(o["telefone"])
+    if not num:
+        flash(f"O cliente {o['cliente']} não tem um telefone válido cadastrado.", "erro")
+        return redirect(url_for("entregas"))
+    saldo = resumo_pagamentos(db, oid)["saldo"]
+    modelo = cfg_get(db, "pronto_msg", "") or MSG_PRONTO_PADRAO
+    nome = (o["cliente"] or "").strip().split(" ")[0].title() or "tudo bem"
+    texto = (modelo.replace("{nome}", nome).replace("{empresa}", empresa_dados(db)["nome"])
+             .replace("{os}", f"{oid:04d}")
+             .replace("{saldo}", f"Saldo a pagar na retirada: {brl(saldo)}." if saldo > 0 else "Pagamento já quitado."))
+    db.execute("UPDATE orcamentos SET pronto_enviado_em=? WHERE id=?", (agora_txt(), oid))
+    db.commit()
+    from urllib.parse import quote
+    return redirect(f"https://wa.me/{num}?text={quote(texto)}")
+
+
+# -------------------------------- Contas a pagar / receber -----------------------------
+def somar_meses(d, n):
+    """d (date) + n meses, no mesmo dia (ou no último dia do mês, se ele não existir)."""
+    import calendar
+    m = d.month - 1 + n
+    ano, mes = d.year + m // 12, m % 12 + 1
+    return d.replace(year=ano, month=mes, day=min(d.day, calendar.monthrange(ano, mes)[1]))
+
+
+def _contas_pendentes(db, tipo):
+    """Lançamentos pendentes (e, para receber, saldos de serviços) com dias até o vencimento."""
+    hoje = datetime.now().date()
+    res = []
+    for r in db.execute("SELECT l.*, c.nome categoria FROM lancamentos l LEFT JOIN fin_categorias c ON c.id=l.categoria_id "
+                        "WHERE l.tipo=? AND l.status='pendente'", (tipo,)):
+        venc = r["vencimento"] or r["data"]
+        try:
+            dias = (datetime.strptime(venc, "%Y-%m-%d").date() - hoje).days
+        except (TypeError, ValueError):
+            dias = None
+        res.append({"origem": "lancamento", "id": r["id"], "tipo": tipo, "descricao": r["descricao"],
+                    "categoria": r["categoria"], "valor": r["valor"], "venc": venc, "dias": dias, "pago": None,
+                    "link": None})
+    if tipo == "receita":
+        res += saldos_a_receber(db, hoje)
+    return res
+
+
+def saldos_a_receber(db, hoje):
+    """Serviços aprovados/concluídos com saldo ainda não pago."""
+    res = []
+    for o in db.execute("SELECT o.*, c.nome cliente, (SELECT COALESCE(SUM(valor),0) FROM pagamentos p "
+                        "WHERE p.orcamento_id=o.id) pago FROM orcamentos o JOIN clientes c ON c.id=o.cliente_id "
+                        "WHERE o.status IN ('aprovado','producao','concluido')"):
+        saldo = o["total"] - o["pago"]
+        if saldo <= 0:
+            continue
+        venc = (o["entrega"] or None) if "entrega" in o.keys() else None
+        try:
+            dias = (datetime.strptime(venc, "%Y-%m-%d").date() - hoje).days if venc else None
+        except ValueError:
+            venc, dias = None, None
+        res.append({"origem": "servico", "id": o["id"], "tipo": "receita",
+                    "descricao": f"Serviço #{o['id']} — {o['cliente']}" + (f" (já pago {brl(o['pago'])})" if o["pago"] else ""),
+                    "categoria": "Serviço", "valor": saldo, "venc": venc, "dias": dias, "pago": None,
+                    "link": url_for("orcamento_ver", oid=o["id"]) + "#pagamentos"})
+    return res
+
+
+@app.route("/contas")
+def contas():
+    db = get_db()
+    aba = request.args.get("aba", "pagar")
+    filtro = request.args.get("filtro", "todas")
+    hoje = datetime.now().date()
+    if aba == "pagas":
+        rows = []
+        for r in db.execute("SELECT l.*, c.nome categoria FROM lancamentos l LEFT JOIN fin_categorias c ON c.id=l.categoria_id "
+                            "WHERE l.status IN ('pago','recebido') AND l.vencimento IS NOT NULL "
+                            "ORDER BY l.pagamento DESC, l.id DESC LIMIT 100"):
+            rows.append({"origem": "lancamento", "id": r["id"], "tipo": r["tipo"], "descricao": r["descricao"],
+                         "categoria": r["categoria"], "valor": r["valor"], "venc": r["vencimento"], "dias": None,
+                         "pago": r["pagamento"], "link": None})
+        todas = rows
+    else:
+        todas = _contas_pendentes(db, "despesa" if aba == "pagar" else "receita")
+        rows = todas
+        if filtro == "vencidas":
+            rows = [r for r in todas if r["dias"] is not None and r["dias"] < 0]
+        elif filtro == "semana":
+            rows = [r for r in todas if r["dias"] is not None and 0 <= r["dias"] <= 7]
+        elif filtro == "mes":
+            px = f"{hoje:%Y-%m}"
+            rows = [r for r in todas if (r["venc"] or "").startswith(px)]
+        rows = sorted(rows, key=lambda r: (r["venc"] or "9999", r["id"]))
+    base = todas if aba != "pagas" else []
+    tot = {"vencidas": sum(r["valor"] for r in base if r["dias"] is not None and r["dias"] < 0),
+           "n_vencidas": sum(1 for r in base if r["dias"] is not None and r["dias"] < 0),
+           "semana": sum(r["valor"] for r in base if r["dias"] is not None and 0 <= r["dias"] <= 7),
+           "n_semana": sum(1 for r in base if r["dias"] is not None and 0 <= r["dias"] <= 7),
+           "aberto": sum(r["valor"] for r in base)}
+    cats = db.execute("SELECT id, nome, tipo FROM fin_categorias WHERE ativo=1 ORDER BY nome").fetchall()
+    return render_template("contas.html", titulo="Contas", rows=rows, aba=aba, filtro=filtro, tot=tot, cats=cats,
+                           hoje=f"{hoje:%Y-%m-%d}")
+
+
+@app.route("/contas/nova", methods=["POST"])
+def conta_nova():
+    db = get_db()
+    f = request.form
+    try:
+        n = max(1, min(60, int(f.get("parcelas") or 1)))
+        d0 = datetime.strptime(f.get("vencimento", ""), "%Y-%m-%d").date()
+    except ValueError:
+        flash("Confira o vencimento e o número de parcelas.", "erro")
+        return redirect(url_for("contas"))
+    erros = set()
+    for i in range(n):
+        venc = somar_meses(d0, i).isoformat()
+        d, e = _lanc_dados(db, {"tipo": f.get("tipo"), "descricao": (f.get("descricao", "").strip()
+                                + (f" ({i + 1}/{n})" if n > 1 else "")), "categoria_id": f.get("categoria_id"),
+                                "valor": f.get("valor"), "data": venc, "vencimento": venc, "status": "pendente"})
+        if e:
+            erros.update(e)
+            break
+        db.execute("INSERT INTO lancamentos(tipo,descricao,categoria_id,valor,data,vencimento,pagamento,status,obs,criado_em) "
+                   "VALUES(?,?,?,?,?,?,?,?,?,?)", (d["tipo"], d["descricao"], d["categoria_id"], d["valor"], d["data"],
+                                                     d["vencimento"], None, "pendente", "", agora_txt()))
+    if erros:
+        db.rollback()
+        for e in sorted(erros):
+            flash(e, "erro")
+    else:
+        db.commit()
+        flash(f"{n} conta(s) criada(s).", "ok")
+    return redirect(url_for("contas", aba="pagar" if f.get("tipo") == "despesa" else "receber"))
+
+
+@app.route("/contas/<int:lid>/baixa", methods=["POST"])
+def conta_baixa(lid):
+    db = get_db()
+    r = db.execute("SELECT * FROM lancamentos WHERE id=? AND status='pendente'", (lid,)).fetchone()
+    data = request.form.get("data", "")
+    volta_inicio = request.form.get("volta") == "inicio"
+    try:
+        datetime.strptime(data, "%Y-%m-%d")
+    except ValueError:
+        flash("Data inválida.", "erro")
+        return redirect(url_for("dashboard" if volta_inicio else "contas"))
+    if r:
+        db.execute("UPDATE lancamentos SET status=?, pagamento=? WHERE id=?",
+                   ("pago" if r["tipo"] == "despesa" else "recebido", data, lid))
+        db.commit()
+        flash("Baixa registrada.", "ok")
+    if volta_inicio:
+        return redirect(url_for("dashboard"))
+    return redirect(url_for("contas", aba="pagar" if r and r["tipo"] == "despesa" else "receber"))
+
+
+@app.route("/contas/<int:lid>/desfazer", methods=["POST"])
+def conta_desfazer(lid):
+    db = get_db()
+    db.execute("UPDATE lancamentos SET status='pendente', pagamento=NULL WHERE id=? AND status IN ('pago','recebido')", (lid,))
+    db.commit()
+    flash("Baixa desfeita: a conta voltou para em aberto.", "ok")
+    return redirect(url_for("contas", aba="pagas"))
+
+
+@app.route("/contas/<int:lid>/excluir", methods=["POST"])
+def conta_excluir(lid):
+    db = get_db()
+    db.execute("DELETE FROM lancamentos WHERE id=? AND status='pendente'", (lid,))
+    db.commit()
+    return redirect(request.referrer or url_for("contas"))
+
+
+def avisos_inicio(db):
+    """Alertas do Início: lista de (classe, texto, link)."""
+    av = []
+    hoje = datetime.now().date()
+    pag = _contas_pendentes(db, "despesa")
+    venc = [r for r in pag if r["dias"] is not None and r["dias"] < 0]
+    prox = [r for r in pag if r["dias"] is not None and 0 <= r["dias"] <= 7]
+    if venc:
+        av.append(("erro", f"{len(venc)} conta(s) a pagar vencida(s): {brl(sum(r['valor'] for r in venc))}.",
+                   url_for("contas", aba="pagar", filtro="vencidas")))
+    if prox:
+        av.append(("aviso", f"{len(prox)} conta(s) a pagar vencem nos próximos 7 dias: {brl(sum(r['valor'] for r in prox))}.",
+                   url_for("contas", aba="pagar", filtro="semana")))
+    ent_atr = ent_hoje = ent_amanha = 0
+    for o in db.execute("SELECT entrega FROM orcamentos WHERE status IN ('aprovado','producao') AND entrega<>''"):
+        d = _ent_dias(o["entrega"], hoje)
+        if d is None:
+            continue
+        ent_atr += d < 0
+        ent_hoje += d == 0
+        ent_amanha += d == 1
+    if ent_atr:
+        av.insert(0, ("erro", f"{ent_atr} serviço(s) com entrega atrasada.", url_for("entregas")))
+    if ent_hoje or ent_amanha:
+        av.insert(0, ("aviso", f"Entregas: {ent_hoje} para hoje e {ent_amanha} para amanhã.", url_for("entregas")))
+    parados = [r for r in _followup_lista(db) if r["devido"]]
+    if parados:
+        av.append(("aviso", f"{len(parados)} orçamento(s) sem resposta há {followup_dias(db)}+ dias "
+                            f"({brl(sum(r['total'] for r in parados))}).", url_for("followup")))
+    sd = [r for r in saldos_a_receber(db, hoje)]
+    ent = db.execute("SELECT id FROM orcamentos WHERE status='concluido'").fetchall()
+    ids = {e["id"] for e in ent}
+    devendo = [r for r in sd if r["id"] in ids]
+    if devendo:
+        av.append(("aviso", f"{len(devendo)} serviço(s) entregue(s) com saldo a receber: "
+                            f"{brl(sum(r['valor'] for r in devendo))}.", url_for("contas", aba="receber")))
+    return av
+
+
+# -------------------------------- Exportar para o contador -----------------------------
+def _csv_txt(v):
+    """Texto seguro para planilha: célula que começa com = + - @ não vira fórmula."""
+    v = "" if v is None else str(v).replace("\r", " ").replace("\n", " ")
+    return ("'" + v) if v[:1] in ("=", "+", "-", "@") else v
+
+
+def _csv_val(c):
+    return f"{(c or 0) / 100:.2f}".replace(".", ",")
+
+
+def _csv(cabecalho, linhas):
+    import csv
+    buf = io.StringIO()
+    w = csv.writer(buf, delimiter=";", lineterminator="\r\n")
+    w.writerow(cabecalho)
+    w.writerows(linhas)
+    return "﻿" + buf.getvalue()
+
+
+@app.route("/exportar")
+def exportar():
+    ano, mes = ler_periodo(request.args)
+    return render_template("exportar.html", titulo="Exportar", ano=ano, mes=mes, meses=MESES)
+
+
+@app.route("/exportar/baixar")
+def exportar_baixar():
+    import zipfile
+    db = get_db()
+    ano, mes = ler_periodo(request.args)
+    px = periodo(ano, mes)
+    n = len(px)
+    arqs = {}
+    arqs["vendas.csv"] = _csv(
+        ["Venda", "Data", "Cliente", "Situação", "Valor bruto", "Desconto", "Total líquido", "Custo dos produtos (CPV)",
+         "Recebido em", "Orçamento"],
+        [[r["id"], (r["data"] or "")[:10], _csv_txt(r["cliente"] or "Consumidor"), r["status"],
+          _csv_val(r["valor_bruto"] if r["valor_bruto"] is not None else r["total"]), _csv_val(r["desconto"]),
+          _csv_val(r["total"]), _csv_val(r["cpv"]) if r["cpv"] is not None else "", (r["recebido_em"] or "")[:10],
+          r["orcamento_id"] or ""]
+         for r in db.execute("SELECT v.*, c.nome cliente FROM vendas v LEFT JOIN clientes c ON c.id=v.cliente_id "
+                             "WHERE substr(v.data,1,?)=? ORDER BY v.data, v.id", (n, px))])
+    arqs["financeiro.csv"] = _csv(
+        ["Data", "Tipo", "Descrição", "Categoria", "Grupo", "Valor", "Vencimento", "Pagamento/recebimento", "Situação"],
+        [[r["data"], r["tipo"], _csv_txt(r["descricao"]), _csv_txt(r["categoria"] or ""), r["grupo"] or "",
+          _csv_val(r["valor"]), r["vencimento"] or "", r["pagamento"] or "", r["status"]]
+         for r in db.execute("SELECT l.*, c.nome categoria, c.grupo FROM lancamentos l LEFT JOIN fin_categorias c "
+                             "ON c.id=l.categoria_id WHERE substr(l.data,1,?)=? ORDER BY l.data, l.id", (n, px))])
+    arqs["bancos.csv"] = _csv(
+        ["Data", "Banco", "Conta", "Histórico", "Contraparte", "Categoria", "Tipo", "Valor"],
+        [[r["data"], r["banco"], r["conta"], _csv_txt(r["historico"]),
+          _csv_txt(contraparte((r["detalhe"] or "").split("\n"))),
+          _csv_txt(r["cat"] or ""), {"receita": "Entrada", "despesa": "Saída", "ignorar": "Ignorado (transferência própria)"}[r["acao"]],
+          _csv_val(r["valor"] if r["sinal"] == "C" else -r["valor"])]
+         for r in db.execute("SELECT l.*, e.banco, e.conta, c.nome cat FROM extrato_linhas l JOIN extratos e "
+                             "ON e.id=l.extrato_id LEFT JOIN banco_categorias c ON c.id=l.categoria_id "
+                             "WHERE l.aplicado=1 AND l.acao IN ('receita','despesa','ignorar') AND substr(l.data,1,?)=? "
+                             "ORDER BY l.data, l.id", (n, px))])
+    arqs["pagamentos_servicos.csv"] = _csv(
+        ["Data", "Serviço", "Cliente", "Forma", "Obs.", "Valor"],
+        [[r["data"], r["orcamento_id"], _csv_txt(r["cliente"]), r["forma"] or "", _csv_txt(r["obs"] or ""), _csv_val(r["valor"])]
+         for r in db.execute("SELECT p.*, c.nome cliente FROM pagamentos p JOIN orcamentos o ON o.id=p.orcamento_id "
+                             "JOIN clientes c ON c.id=o.cliente_id WHERE substr(p.data,1,?)=? ORDER BY p.data, p.id", (n, px))])
+    d = dre_periodo(db, px)
+    arqs["resumo.csv"] = _csv(["Item", "Valor"], [
+        ["Receita bruta de vendas", _csv_val(d["receita_bruta"])], ["(-) Descontos", _csv_val(d["descontos"])],
+        ["(-) Deduções", _csv_val(d["deducoes"])], ["(=) Receita líquida", _csv_val(d["receita_liquida"])],
+        ["(-) Custo dos produtos vendidos", _csv_val(d["cpv"])], ["(=) Lucro bruto", _csv_val(d["lucro_bruto"])],
+        ["(-) Despesas operacionais", _csv_val(d["despesas_operacionais"])],
+        ["(=) Resultado operacional", _csv_val(d["resultado_operacional"])],
+        ["(+/-) Outras receitas e despesas", _csv_val(d["outras_liquido"])],
+        ["(=) Resultado líquido gerencial", _csv_val(d["resultado_liquido"])],
+        ["Caixa: vendas recebidas", _csv_val(d["caixa"]["vendas_recebidas"])],
+        ["Caixa: outras receitas recebidas", _csv_val(d["caixa"]["receitas_recebidas"])],
+        ["Caixa: despesas pagas", _csv_val(d["caixa"]["despesas_pagas"])],
+        ["Caixa: saldo do período", _csv_val(d["caixa"]["saldo"])],
+        ["Vendas ainda a receber", _csv_val(d["caixa"]["vendas_a_receber"])],
+        ["Aviso", "Custo incompleto em alguma venda: lucro parcial" if d["cpv_incompleto"] else ""]])
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+        for nome, conteudo in arqs.items():
+            z.writestr(nome, conteudo.encode("utf-8"))
+    buf.seek(0)
+    return send_file(buf, mimetype="application/zip", as_attachment=True,
+                     download_name=f"contador_{px.replace('-', '_')}.zip")
+
+
+# -------------------------------- Relatórios -----------------------------
+@app.route("/relatorios")
+def relatorios():
+    db = get_db()
+    ano, mes = ler_periodo(request.args)
+    px = periodo(ano, mes)
+    dias = max(15, min(1000, inteiro(request.args.get("dias"), 90)))
+    prods = {}
+    for r in db.execute(
+            "SELECT oi.produto_id pid, COALESCE(p.nome, oi.descricao) nome, SUM(oi.qtd) qtd, SUM(oi.subtotal) receita "
+            "FROM orcamento_itens oi JOIN vendas v ON v.orcamento_id=oi.orcamento_id AND v.status='ativa' "
+            "LEFT JOIN produtos p ON p.id=oi.produto_id WHERE substr(v.data,1,?)=? "
+            "GROUP BY oi.produto_id, COALESCE(p.nome, oi.descricao)", (len(px), px)):
+        prods[(r["pid"], r["nome"])] = {"nome": r["nome"], "qtd": r["qtd"] or 0, "receita": r["receita"] or 0,
+                                        "custo": None, "pid": r["pid"]}
+    for r in db.execute(
+            "SELECT ii.produto_id pid, p.nome nome, SUM(ii.qtd) qtd, SUM(ii.qtd*ii.preco_unit) receita "
+            "FROM itens_venda ii JOIN vendas v ON v.id=ii.venda_id AND v.status='ativa' AND v.orcamento_id IS NULL "
+            "JOIN produtos p ON p.id=ii.produto_id WHERE substr(v.data,1,?)=? GROUP BY ii.produto_id", (len(px), px)):
+        d = prods.setdefault((r["pid"], r["nome"]), {"nome": r["nome"], "qtd": 0, "receita": 0, "custo": None, "pid": r["pid"]})
+        d["qtd"] += r["qtd"] or 0
+        d["receita"] += r["receita"] or 0
+    for r in db.execute(
+            "SELECT vc.produto_id pid, SUM(vc.subtotal) custo FROM venda_custos vc JOIN vendas v ON v.id=vc.venda_id "
+            "AND v.status='ativa' WHERE vc.conhecido=1 AND vc.produto_id IS NOT NULL AND substr(v.data,1,?)=? "
+            "GROUP BY vc.produto_id", (len(px), px)):
+        for k, d in prods.items():
+            if d["pid"] == r["pid"]:
+                d["custo"] = r["custo"]
+    lista = sorted(prods.values(), key=lambda d: -d["receita"])[:20]
+    for d in lista:
+        d["margem"] = (d["receita"] - d["custo"]) if d["custo"] is not None else None
+    clientes = db.execute(
+        "SELECT c.id, c.nome, COUNT(*) n, SUM(v.total) total FROM vendas v JOIN clientes c ON c.id=v.cliente_id "
+        "WHERE v.status='ativa' AND substr(v.data,1,?)=? GROUP BY c.id ORDER BY total DESC LIMIT 10", (len(px), px)).fetchall()
+    hoje = datetime.now().date()
+    inativos = []
+    from urllib.parse import quote
+    emp = empresa_dados(db)["nome"]
+    for c in db.execute(
+            "SELECT c.id, c.nome, c.telefone, MAX(v.data) ultima, SUM(v.total) total FROM vendas v JOIN clientes c "
+            "ON c.id=v.cliente_id WHERE v.status='ativa' GROUP BY c.id ORDER BY ultima"):
+        try:
+            ult = datetime.strptime(c["ultima"][:10], "%Y-%m-%d").date()
+        except (TypeError, ValueError):
+            continue
+        d = (hoje - ult).days
+        if d >= dias:
+            num = numero_whatsapp(c["telefone"])
+            nome = (c["nome"] or "").split(" ")[0].title()
+            txt = f"Olá, {nome}! Aqui é da {emp}. Faz um tempo que não nos vemos. Precisando de uma moldura, um quadro ou um conserto, é só chamar! 😊"
+            inativos.append({"id": c["id"], "nome": c["nome"], "telefone": c["telefone"], "ultima": c["ultima"][:10],
+                             "dias_sem": d, "total": c["total"],
+                             "wa": f"https://wa.me/{num}?text={quote(txt)}" if num else ""})
+    return render_template("relatorios.html", titulo="Relatórios", ano=ano, mes=mes, meses=MESES, dias=dias,
+                           prods=lista, clientes=clientes, inativos=inativos[:50])
+
+
+# -------------------------------- Marketplaces (UpSeller) ----------------------
+def ler_xlsx(dados):
+    """Lê a primeira planilha de um .xlsx (sem bibliotecas externas). Devolve lista de linhas."""
+    import zipfile
+    import xml.etree.ElementTree as ET
+    ns = {"m": "http://schemas.openxmlformats.org/spreadsheetml/2006/main"}
+    z = zipfile.ZipFile(io.BytesIO(dados))
+    ss = []
+    if "xl/sharedStrings.xml" in z.namelist():
+        for si in ET.fromstring(z.read("xl/sharedStrings.xml")).findall("m:si", ns):
+            ss.append("".join(t.text or "" for t in si.iter("{%s}t" % ns["m"])))
+    nome = sorted(n for n in z.namelist() if n.startswith("xl/worksheets/sheet"))[0]
+    linhas = []
+    for row in ET.fromstring(z.read(nome)).iter("{%s}row" % ns["m"]):
+        cels = {}
+        for c in row.findall("m:c", ns):
+            col = re.match(r"[A-Z]+", c.get("r")).group(0)
+            idx = 0
+            for ch in col:
+                idx = idx * 26 + ord(ch) - 64
+            t = c.get("t")
+            if t == "inlineStr":
+                v = "".join(x.text or "" for x in c.iter("{%s}t" % ns["m"]))
+            else:
+                ve = c.find("m:v", ns)
+                v = ve.text if ve is not None else None
+                if v is not None and t == "s":
+                    v = ss[int(v)]
+            cels[idx - 1] = v
+        linhas.append([cels.get(i) for i in range(max(cels) + 1)] if cels else [])
+    return linhas
+
+
+def _num_c(v):
+    try:
+        return int((Decimal(str(v or 0)) * 100).quantize(Decimal("1"), ROUND_HALF_UP))
+    except InvalidOperation:
+        return 0
+
+
+def _num_i(v):
+    try:
+        return int(Decimal(str(v or 0)))
+    except InvalidOperation:
+        return 0
+
+
+def mkt_loja(nome):
+    """'Cir shopee[Shopee BR]' -> 'Cir shopee'."""
+    return re.sub(r"\s*\[.*\]\s*$", "", str(nome or "")).strip()
+
+
+def _data_xlsx(v):
+    """Data do Excel: número de série (46295), 'AAAA-MM-DD' ou 'DD/MM/AAAA' -> 'AAAA-MM-DD' (ou None)."""
+    from datetime import timedelta
+    t = str(v or "").strip()
+    try:
+        if re.fullmatch(r"\d+(\.\d+)?", t):
+            return (datetime(1899, 12, 30) + timedelta(days=int(float(t)))).strftime("%Y-%m-%d")
+        if re.fullmatch(r"\d{4}-\d{2}-\d{2}.*", t):
+            return datetime.strptime(t[:10], "%Y-%m-%d").strftime("%Y-%m-%d")
+        if re.fullmatch(r"\d{2}/\d{2}/\d{4}", t):
+            return datetime.strptime(t, "%d/%m/%Y").strftime("%Y-%m-%d")
+    except (ValueError, OverflowError):
+        pass
+    return None
+
+
+def _importar_mkt_diario(linhas):
+    cab = [str(c or "").strip().lower() for c in linhas[0]]
+    def ci(*ns):
+        for n in ns:
+            if n in cab:
+                return cab.index(n)
+        return None
+    c = dict(ped=ci("total de pedidos"), val=ci("valor total de vendas"), vp=ci("pedidos válidos", "pedidos validos"),
+             vv=ci("valor de vendas válidas", "valor de vendas validas"), cp=ci("pedidos cancelados"),
+             cv=ci("valor de vendas canceladas"), cli=ci("clientes"))
+    db = get_db()
+    n, datas = 0, []
+    for l in linhas[1:]:
+        d = _data_xlsx(l[0] if l else None)
+        if not d:
+            continue
+        g = lambda k: l[c[k]] if c[k] is not None and c[k] < len(l) else None
+        db.execute("""INSERT INTO mkt_diario(data,pedidos,valor,validos,valor_validos,cancelados,valor_cancelados,clientes,importado_em)
+            VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(data) DO UPDATE SET pedidos=excluded.pedidos,valor=excluded.valor,
+            validos=excluded.validos,valor_validos=excluded.valor_validos,cancelados=excluded.cancelados,
+            valor_cancelados=excluded.valor_cancelados,clientes=excluded.clientes,importado_em=excluded.importado_em""",
+                   (d, _num_i(g("ped")), _num_c(g("val")), _num_i(g("vp")), _num_c(g("vv")), _num_i(g("cp")), _num_c(g("cv")),
+                    _num_i(g("cli")), agora_txt()))
+        n += 1
+        datas.append(d)
+    db.commit()
+    if not n:
+        flash("Não encontrei datas válidas nesse relatório diário.", "erro")
+        return redirect(url_for("marketplaces_dados"))
+    a, b = min(datas), max(datas)
+    flash(f"Relatório diário importado: {n} dia(s), de {a[8:]}/{a[5:7]} a {b[8:]}/{b[5:7]}. Dias já importados foram atualizados, sem duplicar.", "ok")
+    return redirect(url_for("marketplaces", dm=b[:7]))
+
+
+def _importar_mkt_variantes(linhas, cab, ini, fim):
+    nomes = ("produtos", "loja", "sku", "variantes", "id da variante", "sku principal", "id do anúncios",
+             "pedidos válidos", "unidades vendidas", "valor de vendas")
+    ix = {n: cab.index(n) for n in nomes if n in cab}
+    if "valor de vendas" not in ix:
+        flash("Faltam colunas no relatório de variantes (Valor de Vendas).", "erro")
+        return redirect(url_for("marketplaces_dados"))
+    def g(l, k):
+        i = ix.get(k)
+        return l[i] if i is not None and i < len(l) else None
+    db = get_db()
+    db.execute("DELETE FROM mkt_variantes WHERE ini=? AND fim=?", (ini, fim))
+    n = 0
+    for l in linhas[1:]:
+        nome = str(g(l, "produtos") or "").strip()
+        if not nome:
+            continue
+        un, val = _num_i(g(l, "unidades vendidas")), _num_c(g(l, "valor de vendas"))
+        if un <= 0 and val <= 0:
+            continue
+        db.execute("""INSERT INTO mkt_variantes(ini,fim,produto,loja,sku,variante,variante_id,sku_principal,anuncio,pedidos,unidades,valor,importado_em)
+                      VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                   (ini, fim, nome, mkt_loja(g(l, "loja")), _idn(g(l, "sku")), str(g(l, "variantes") or "").strip(),
+                    _idn(g(l, "id da variante")), _idn(g(l, "sku principal")), _idn(g(l, "id do anúncios")),
+                    _num_i(g(l, "pedidos válidos")), un, val, agora_txt()))
+        n += 1
+    db.commit()
+    flash(f"{n} variação(ões) importada(s) para {ini[8:]}/{ini[5:7]} a {fim[8:]}/{fim[5:7]}. Preencha o custo de cada variação.", "ok")
+    return redirect(url_for("marketplaces", aba="lucro", p=f"{ini}|{fim}"))
+
+
+def _importar_mkt_produtos(linhas, cab, ini, fim):
+    ix = {n: cab.index(n) for n in ("produtos", "loja", "sku principal", "id do anúncios", "pedidos válidos",
+                                    "unidades vendidas", "valor de vendas") if n in cab}
+    if "valor de vendas" not in ix:
+        flash("Faltam colunas no relatório de produtos (Valor de Vendas).", "erro")
+        return redirect(url_for("marketplaces_dados"))
+    def g(l, k):
+        i = ix.get(k)
+        return l[i] if i is not None and i < len(l) else None
+    db = get_db()
+    db.execute("DELETE FROM mkt_produtos WHERE ini=? AND fim=?", (ini, fim))
+    n = 0
+    for l in linhas[1:]:
+        nome = str(g(l, "produtos") or "").strip()
+        if not nome:
+            continue
+        db.execute("INSERT INTO mkt_produtos(ini,fim,produto,loja,sku,anuncio,pedidos,unidades,valor,importado_em) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                   (ini, fim, nome, mkt_loja(g(l, "loja")), _idn(g(l, "sku principal")),
+                    _idn(g(l, "id do anúncios")), _num_i(g(l, "pedidos válidos")),
+                    _num_i(g(l, "unidades vendidas")), _num_c(g(l, "valor de vendas")), agora_txt()))
+        n += 1
+    db.commit()
+    flash(f"{n} produto(s) importado(s) para {ini[8:]}/{ini[5:7]} a {fim[8:]}/{fim[5:7]}. Preencha o custo e as taxas para ver o lucro.", "ok")
+    return redirect(url_for("marketplaces", aba="lucro", p=f"{ini}|{fim}"))
+
+
+def _bp(v):
+    """'12,5' -> 1250 (centésimos de %). None se inválido ou fora de 0-100."""
+    try:
+        d = Decimal(str(v).replace("%", "").replace(",", ".").strip() or "0")
+    except InvalidOperation:
+        return None
+    if d < 0 or d > 100:
+        return None
+    return int((d * 100).quantize(Decimal("1"), ROUND_HALF_UP))
+
+
+def _idn(v):
+    """Normaliza ID/SKU vindo do Excel: '1649.0' -> '1649', '2.0297405553E10' -> '20297405553'."""
+    t = str(v if v is not None else "").strip()
+    if re.fullmatch(r"\d+\.0+", t):
+        t = t.split(".")[0]
+    elif re.fullmatch(r"\d(\.\d+)?[eE]\+?\d+", t):
+        try:
+            t = str(int(Decimal(t)))
+        except InvalidOperation:
+            pass
+    return t
+
+
+def _importar_mkt_catalogo(linhas, hi):
+    cab = [str(c or "").strip().lower() for c in linhas[hi]]
+    ci = cab.index("id do produto")
+    cs = cab.index("sku de referência") if "sku de referência" in cab else None
+    cn = cab.index("nome do produto") if "nome do produto" in cab else None
+    db = get_db()
+    db.execute("DELETE FROM mkt_catalogo")
+    n = 0
+    for l in linhas[hi + 1:]:
+        pid = _idn(l[ci] if ci < len(l) else "")
+        if not pid:
+            continue
+        sku = _idn(l[cs]) if cs is not None and cs < len(l) else ""
+        nome = str(l[cn] or "").strip() if cn is not None and cn < len(l) else ""
+        db.execute("INSERT OR REPLACE INTO mkt_catalogo(produto_id, sku, nome) VALUES(?,?,?)", (pid, sku, nome))
+        n += 1
+    db.commit()
+    flash(f"Catálogo de referência carregado: {n} produto(s). As vendas agora são agrupadas por eles.", "ok")
+    return redirect(url_for("marketplaces", aba="lucro"))
+
+
+def _nome_norm(t):
+    t = re.sub(r"[^a-z0-9 ]+", " ", str(t or "").lower())
+    return " ".join(t.split())
+
+
+def mkt_resolver(db):
+    """Devolve (func, grupos): func(sku, anuncio) -> (chave_grupo, origem_do_vinculo) ou (None, None)."""
+    cat = [dict(r) for r in db.execute("SELECT * FROM mkt_catalogo")]
+    por_id = {c["produto_id"]: c for c in cat}
+    skus = {c["sku"] for c in cat if c["sku"]}
+    manual = {r["origem"]: r["grupo"] for r in db.execute("SELECT origem, grupo FROM mkt_vinculos")}
+    grupos = {}
+    for c in cat:
+        k = c["sku"] or "id:" + c["produto_id"]
+        g = grupos.setdefault(k, {"chave": k, "nomes": [], "ids": []})
+        g["nomes"].append(c["nome"])
+        g["ids"].append(c["produto_id"])
+    def res(sku, anuncio):
+        o_a, o_s = "a:" + anuncio if anuncio else None, "s:" + sku if sku else None
+        for o in (o_a, o_s):
+            if o and o in manual and manual[o] in grupos:
+                return manual[o], "manual"
+        if anuncio in por_id:
+            c = por_id[anuncio]
+            return (c["sku"] or "id:" + c["produto_id"]), "auto"
+        if sku and sku in skus:
+            return sku, "auto"
+        if sku and "--" in sku and sku.split("--")[0] in skus:
+            return sku.split("--")[0], "auto"
+        return None, None
+    return res, grupos
+
+
+def mkt_calcular(db, ini, fim):
+    """Lucro por produto padrão (catálogo), em centavos inteiros. Variações/lojas são somadas num produto só."""
+    custos = {r["chave"]: r["custo"] for r in db.execute("SELECT chave, custo FROM mkt_custos")}
+    cad = {}
+    for r in db.execute("SELECT sku, custo FROM produtos WHERE sku IS NOT NULL AND sku<>'' AND custo>0"):
+        cad.setdefault(r["sku"].strip(), r["custo"])
+    taxas = {r["loja"]: (r["comissao"], r["imposto"]) for r in db.execute("SELECT * FROM mkt_taxas")}
+    ign = {r["chave"] for r in db.execute("SELECT chave FROM mkt_ignorados")}
+    try:
+        mb = int(cfg_get(db, "mkt_margem", "3000"))                  # margem desejada, em centésimos de %
+    except ValueError:
+        mb = 3000
+    res, grupos = mkt_resolver(db)
+    def pc(valor, bp):
+        return int((Decimal(valor) * bp / 10000).quantize(Decimal("1"), ROUND_HALF_UP))
+    ag, lojas, ignorados, sem_vinc_d = {}, {}, {}, {}
+    # SKU de variação que, numa mesma loja, serve para variações diferentes (ex.: Shein usa o SKU do pai em todos os tamanhos)
+    # não pode ser a chave do custo: cada variação passa a ter custo próprio (pelo ID da variante).
+    _lab = {}
+    for r in db.execute("SELECT sku, loja, variante, variante_id FROM mkt_variantes WHERE sku<>''"):
+        _lab.setdefault((_idn(r["sku"]), r["loja"]), set()).add((r["variante_id"] or r["variante"]).strip().lower())
+    ambiguos = {k[0] for k, v in _lab.items() if len(v) > 1}
+    fonte = [dict(r, _var=True) for r in db.execute("SELECT * FROM mkt_variantes WHERE ini=? AND fim=? ORDER BY valor DESC", (ini, fim))]
+    if not fonte:
+        fonte = [dict(r, _var=False) for r in db.execute("SELECT * FROM mkt_produtos WHERE ini=? AND fim=? ORDER BY valor DESC", (ini, fim))]
+    for d in fonte:
+        if d["_var"]:
+            d["sku_var"] = _idn(d["sku"])
+            d["sku"] = _idn(d["sku_principal"])
+        sku, anu = _idn(d["sku"]), _idn(d["anuncio"])
+        chave, como = res(sku, anu)
+        d["origem"] = ("a:" + anu) if anu else (("s:" + sku) if sku else "n:" + _nome_norm(d["produto"])[:60])
+        if chave is None:
+            chave = sku or ("a:" + anu if anu else "n:" + _nome_norm(d["produto"])[:60])
+            d["vinculado"] = False
+        else:
+            d["vinculado"] = True
+        d["grupo_como"] = como
+        if chave in ign:
+            x = ignorados.setdefault(chave, {"chave": chave, "nome": d["produto"], "valor": 0})
+            x["valor"] += d["valor"]
+            continue
+        g = ag.setdefault(chave, {"chave": chave, "fontes": [], "unidades": 0, "pedidos": 0, "valor": 0, "custo": 0,
+                                  "comissao": 0, "imposto": 0, "lojas": set()})
+        g["fontes"].append(d)
+        g["unidades"] += d["unidades"]; g["pedidos"] += d["pedidos"]; g["valor"] += d["valor"]
+        g["lojas"].add(d["loja"])
+        if not d["vinculado"]:
+            sv = sem_vinc_d.setdefault(d["origem"], dict(d, valor=0))
+            sv["valor"] += d["valor"]
+    sem_vinc = list(sem_vinc_d.values())
+    T = dict(receita=0, custo=0, comissao=0, imposto=0, lucro=0, sem_custo=0)
+    rows = []
+    for chave, g in ag.items():
+        cu = custos[chave] if chave in custos else cad.get(chave, 0)     # custo padrão do produto
+        g["fontes"].sort(key=lambda f: -f["valor"])
+        falta = False
+        for f in g["fontes"]:
+            cb, ib = taxas.get(f["loja"], (0, 0))
+            if f["_var"]:
+                unico = f["variante_id"] or f["origem"] + "|" + f["variante"]
+                vk = "v:" + (unico if (not f["sku_var"] or f["sku_var"] in ambiguos) else f["sku_var"])
+                f["rotulo"] = f["variante"] or f["produto"]
+                f["sub"] = " · ".join(x for x in (f["sku_var"], f["anuncio"]) if x)
+            else:
+                vk = "v:" + f["origem"]
+                f["rotulo"] = f["produto"]
+                f["sub"] = f["sku"] or f["anuncio"]
+            # variação de quantidade: "Roxo Lavanda,5" = pacote com 5 peças -> custo da peça x 5
+            mq = re.search(r",\s*(\d{1,3})\s*$", f["variante"]) if f["_var"] else None
+            f["qtd"] = max(int(mq.group(1)), 1) if mq else 1
+            do_cad = cad.get(f.get("sku_var") or "", 0)
+            f["custo_chave"] = vk
+            antigo = "v:" + f["sku_var"] if f["_var"] and f["sku_var"] else None    # chave usada antes da separação
+            if vk not in custos and f["_var"] and antigo and antigo != vk and antigo in custos:
+                custos[vk] = custos[antigo]                                            # migra o valor que você já tinha digitado
+            f["custo_fmt"] = dinheiro(custos[vk]) if vk in custos else ""
+            if vk in custos:
+                f["custo_base"] = custos[vk]
+                f["custo_unit"] = custos[vk] * f["qtd"]
+            elif do_cad:
+                f["custo_base"] = f["custo_unit"] = do_cad            # custo cadastrado exatamente para este SKU
+            else:
+                f["custo_base"] = cu
+                f["custo_unit"] = cu * f["qtd"]
+            f["custo_herdado"] = dinheiro(cu) if cu else ""
+            f["custo"] = f["custo_unit"] * f["unidades"]
+            f["comissao"], f["imposto"] = pc(f["valor"], cb), pc(f["valor"], ib)
+            f["lucro"] = f["valor"] - f["custo"] - f["comissao"] - f["imposto"]
+            f["margem"] = f["lucro"] * 100.0 / f["valor"] if f["valor"] else 0
+            f["preco_atual"] = f["valor"] // f["unidades"] if f["unidades"] else 0
+            den = 10000 - cb - ib - mb                                  # preço mínimo = custo / (1 - comissão - imposto - margem)
+            f["preco_min"] = int((Decimal(f["custo_unit"]) * 10000 / den).to_integral_value(ROUND_CEILING)) if (den > 0 and f["custo_unit"]) else None
+            f["abaixo"] = bool(f["preco_min"] and f["unidades"] and f["preco_atual"] < f["preco_min"])
+            g["comissao"] += f["comissao"]
+            g["imposto"] += f["imposto"]
+            g["custo"] += f["custo"]
+            falta = falta or not f["custo_unit"]
+            lojas[f["loja"]] = lojas.get(f["loja"], 0) + f["valor"]
+        g["custo_unit"], g["custo_fmt"] = cu, (dinheiro(cu) if cu else "")
+        g["varia"] = len({f["custo_base"] for f in g["fontes"]}) > 1
+        g["falta_custo"] = falta
+        g["lucro"] = g["valor"] - g["custo"] - g["comissao"] - g["imposto"]
+        g["margem"] = g["lucro"] * 100.0 / g["valor"] if g["valor"] else 0
+        g["preco_atual"] = g["valor"] // g["unidades"] if g["unidades"] else 0
+        if g["unidades"] and all(f["preco_min"] for f in g["fontes"]):
+            g["preco_min"] = sum(f["preco_min"] * f["unidades"] for f in g["fontes"]) // g["unidades"]
+        else:
+            g["preco_min"] = None
+        g["abaixo"] = bool(g["preco_min"] and g["preco_atual"] < g["preco_min"])
+        g["n_abaixo"] = sum(1 for f in g["fontes"] if f["abaixo"])
+        if chave in grupos:
+            nomes = grupos[chave]["nomes"]
+            ids = grupos[chave]["ids"]
+            melhor = max(g["fontes"], key=lambda f: f["valor"])
+            g["produto"] = next((n for i, n in zip(ids, nomes) if i == _idn(melhor["anuncio"])), nomes[0]) or chave
+            g["padrao"] = True
+        else:
+            g["produto"] = max(g["fontes"], key=lambda f: f["valor"])["produto"]
+            g["padrao"] = False
+        g["lojas"] = sorted(g["lojas"])
+        g["sku"] = chave if not chave.startswith(("id:", "a:", "n:")) else ""
+        rows.append(g)
+        for k in ("custo", "comissao", "imposto", "lucro"):
+            T[k] += g[k]
+        T["receita"] += g["valor"]
+        T["sem_custo"] += 1 if g["falta_custo"] else 0
+    rows.sort(key=lambda x: -x["valor"])
+    T["margem"] = T["lucro"] * 100.0 / T["receita"] if T["receita"] else 0
+    T["markup"] = T["lucro"] * 100.0 / T["custo"] if T["custo"] else 0
+    lojas_t = [dict(loja=l, receita=v, comissao=_fmt_bp(taxas.get(l, (0, 0))[0]), imposto=_fmt_bp(taxas.get(l, (0, 0))[1]))
+               for l, v in sorted(lojas.items(), key=lambda x: -x[1])]
+    # sugestões de vínculo por semelhança de nome (só sugere; quem confirma é você)
+    opcoes = []
+    for k, g in grupos.items():
+        opcoes.append({"chave": k, "nome": (g["nomes"][0] or k)[:70], "n": _nome_norm(g["nomes"][0])})
+    import difflib
+    for f in sem_vinc:
+        n, best, sc = _nome_norm(f["produto"]), None, 0
+        for o in opcoes:
+            s_ = difflib.SequenceMatcher(None, n, o["n"]).ratio()
+            if s_ > sc:
+                best, sc = o, s_
+        f["sugestao"] = best["chave"] if best and sc >= 0.6 else ""
+    T["fonte_var"] = bool(fonte and fonte[0]["_var"])
+    T["margem_alvo"] = _fmt_bp(mb) or "0"
+    T["n_abaixo"] = sum(1 for g in rows if g["abaixo"] or g["n_abaixo"])
+    return rows, T, lojas_t, dict(sem_vinc=sem_vinc, opcoes=sorted(opcoes, key=lambda o: o["nome"]),
+                                  ignorados=list(ignorados.values()), n_cat=len(grupos))
+
+
+def _fmt_bp(bp):
+    return (f"{bp / 100:.2f}".rstrip("0").rstrip(".") if bp else "").replace(".", ",")
+
+
+@app.route("/api/marketplaces/custo", methods=["POST"])
+def api_mkt_custo():
+    d = request.get_json(silent=True) or {}
+    chave = str(d.get("chave", "")).strip()
+    if not chave:
+        return jsonify(ok=False, erros=["Produto sem SKU."]), 400
+    txt = str(d.get("custo", "")).strip()
+    db = get_db()
+    if txt == "":
+        db.execute("DELETE FROM mkt_custos WHERE chave=?", (chave,))
+    else:
+        c = para_centavos(txt)
+        if c is None or c < 0:
+            return jsonify(ok=False, erros=["Custo inválido."]), 400
+        db.execute("INSERT INTO mkt_custos(chave,custo) VALUES(?,?) ON CONFLICT(chave) DO UPDATE SET custo=excluded.custo", (chave, c))
+    db.commit()
+    return jsonify(ok=True)
+
+
+@app.route("/api/marketplaces/margem", methods=["POST"])
+def api_mkt_margem():
+    d = request.get_json(silent=True) or {}
+    bp = _bp(d.get("valor", ""))
+    if bp is None or bp >= 10000:
+        return jsonify(ok=False, erros=["Informe uma margem entre 0 e 99,99%."]), 400
+    db = get_db()
+    cfg_set(db, "mkt_margem", str(bp))
+    db.commit()
+    return jsonify(ok=True)
+
+
+@app.route("/api/marketplaces/taxa", methods=["POST"])
+def api_mkt_taxa():
+    d = request.get_json(silent=True) or {}
+    loja, campo = str(d.get("loja", "")).strip(), d.get("campo")
+    bp = _bp(d.get("valor", ""))
+    if not loja or campo not in ("comissao", "imposto") or bp is None:
+        return jsonify(ok=False, erros=["Informe uma porcentagem entre 0 e 100."]), 400
+    db = get_db()
+    db.execute("INSERT OR IGNORE INTO mkt_taxas(loja) VALUES(?)", (loja,))
+    db.execute(f"UPDATE mkt_taxas SET {campo}=? WHERE loja=?", (bp, loja))
+    db.commit()
+    return jsonify(ok=True)
+
+
+@app.route("/api/marketplaces/excluir", methods=["POST"])
+def api_mkt_excluir():
+    d = request.get_json(silent=True) or {}
+    chave = str(d.get("chave", "")).strip()
+    if not chave:
+        return jsonify(ok=False, erros=["Produto inválido."]), 400
+    db = get_db()
+    if d.get("restaurar"):
+        db.execute("DELETE FROM mkt_ignorados WHERE chave=?", (chave,))
+    else:
+        db.execute("INSERT OR IGNORE INTO mkt_ignorados(chave) VALUES(?)", (chave,))
+    db.commit()
+    return jsonify(ok=True)
+
+
+@app.route("/api/marketplaces/vinculo", methods=["POST"])
+def api_mkt_vinculo():
+    d = request.get_json(silent=True) or {}
+    db = get_db()
+    pares = d.get("pares") if isinstance(d.get("pares"), list) else [d]
+    for p in pares:
+        origem, grupo = str(p.get("origem", "")).strip(), str(p.get("grupo", "")).strip()
+        if not origem:
+            return jsonify(ok=False, erros=["Origem inválida."]), 400
+        if not grupo:
+            db.execute("DELETE FROM mkt_vinculos WHERE origem=?", (origem,))
+        else:
+            if not db.execute("SELECT 1 FROM mkt_catalogo WHERE sku=? OR 'id:'||produto_id=?", (grupo, grupo)).fetchone():
+                return jsonify(ok=False, erros=["Produto de referência não encontrado."]), 400
+            db.execute("INSERT INTO mkt_vinculos(origem,grupo) VALUES(?,?) ON CONFLICT(origem) DO UPDATE SET grupo=excluded.grupo", (origem, grupo))
+    db.commit()
+    return jsonify(ok=True)
+
+
+@app.route("/marketplaces/limpar-catalogo", methods=["POST"])
+def marketplaces_limpar_catalogo():
+    db = get_db()
+    db.execute("DELETE FROM mkt_catalogo")
+    db.execute("DELETE FROM mkt_vinculos")
+    db.commit()
+    flash("Catálogo de referência removido.", "ok")
+    return redirect(url_for("marketplaces_dados"))
+
+
+@app.route("/marketplaces/excluir-produtos", methods=["POST"])
+def marketplaces_excluir_produtos():
+    db = get_db()
+    for tb in ("mkt_produtos", "mkt_variantes"):
+        db.execute(f"DELETE FROM {tb} WHERE ini=? AND fim=?", (request.form.get("ini", ""), request.form.get("fim", "")))
+    db.commit()
+    flash("Período excluído.", "ok")
+    return redirect(url_for("marketplaces", aba="lucro"))
+
+
+@app.route("/marketplaces/importar", methods=["POST"])
+def marketplaces_importar():
+    arq = request.files.get("arquivo")
+    if not arq or not arq.filename:
+        flash("Escolha o arquivo .xlsx do UpSeller.", "erro")
+        return redirect(url_for("marketplaces_dados"))
+    try:
+        linhas = ler_xlsx(arq.read())
+    except Exception:
+        flash("Não consegui ler esse arquivo. Use o .xlsx exportado pelo UpSeller.", "erro")
+        return redirect(url_for("marketplaces_dados"))
+    for hi in range(min(6, len(linhas))):
+        if "id do produto" in [str(c or "").strip().lower() for c in linhas[hi]]:
+            return _importar_mkt_catalogo(linhas, hi)
+    if linhas and [str(c or "").strip().lower() for c in linhas[0]][:1] == ["data"] and \
+            "valor de vendas válidas" in [str(c or "").strip().lower() for c in linhas[0]]:
+        return _importar_mkt_diario(linhas)
+    ini = fim = None
+    m = re.search(r"(\d{8})-(\d{8})", arq.filename)
+    if m:
+        try:
+            ini = datetime.strptime(m.group(1), "%Y%m%d").strftime("%Y-%m-%d")
+            fim = datetime.strptime(m.group(2), "%Y%m%d").strftime("%Y-%m-%d")
+        except ValueError:
+            ini = fim = None
+    if request.form.get("ini") and request.form.get("fim"):
+        ini, fim = request.form["ini"], request.form["fim"]
+    if not ini or not fim or ini > fim:
+        flash("Não consegui descobrir o período pelo nome do arquivo. Informe início e fim.", "erro")
+        return redirect(url_for("marketplaces_dados"))
+    if not linhas:
+        flash("Arquivo vazio.", "erro")
+        return redirect(url_for("marketplaces_dados"))
+    cab = [str(c or "").strip().lower() for c in linhas[0]]
+    if "unidades vendidas" in cab and "variantes" in cab and "id da variante" in cab:
+        return _importar_mkt_variantes(linhas, cab, ini, fim)
+    if "unidades vendidas" in cab and "produtos" in cab:
+        return _importar_mkt_produtos(linhas, cab, ini, fim)
+    def col(*nomes):
+        for n in nomes:
+            if n in cab:
+                return cab.index(n)
+        return None
+    c = {"loja": col("loja"), "plat": col("plataforma"), "ped": col("total de pedidos"),
+         "val": col("valor total de vendas"), "vp": col("pedidos válidos", "pedidos validos"),
+         "vv": col("valor de vendas válidas", "valor de vendas validas"),
+         "cp": col("pedidos cancelados"), "cv": col("valor de vendas canceladas"), "cli": col("clientes")}
+    if c["loja"] is None or c["vv"] is None or c["vp"] is None:
+        flash("Este não parece o relatório “Vendas loja performance” (faltam as colunas Loja / Pedidos Válidos / Valor de Vendas Válidas).", "erro")
+        return redirect(url_for("marketplaces_dados"))
+    def g(l, k):
+        i = c[k]
+        return l[i] if i is not None and i < len(l) else None
+    db = get_db()
+    n = 0
+    for l in linhas[1:]:
+        loja = str(g(l, "loja") or "").strip()
+        if not loja:
+            continue
+        db.execute("""INSERT INTO mkt_resumo(loja,plataforma,ini,fim,pedidos,valor,validos,valor_validos,cancelados,valor_cancelados,clientes,importado_em)
+            VALUES(?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(loja,ini,fim) DO UPDATE SET plataforma=excluded.plataforma,
+            pedidos=excluded.pedidos,valor=excluded.valor,validos=excluded.validos,valor_validos=excluded.valor_validos,
+            cancelados=excluded.cancelados,valor_cancelados=excluded.valor_cancelados,clientes=excluded.clientes,importado_em=excluded.importado_em""",
+            (loja, str(g(l, "plat") or ""), ini, fim, _num_i(g(l, "ped")), _num_c(g(l, "val")), _num_i(g(l, "vp")),
+             _num_c(g(l, "vv")), _num_i(g(l, "cp")), _num_c(g(l, "cv")), _num_i(g(l, "cli")), agora_txt()))
+        n += 1
+    db.commit()
+    flash(f"{n} loja(s) importada(s) para o período {ini[8:]}/{ini[5:7]} a {fim[8:]}/{fim[5:7]}.", "ok")
+    return redirect(url_for("marketplaces", p=f"{ini}|{fim}"))
+
+
+_MES_PT = ["jan", "fev", "mar", "abr", "mai", "jun", "jul", "ago", "set", "out", "nov", "dez"]
+
+
+def _mes_info(ini, fim):
+    import calendar
+    a, m = int(ini[:4]), int(ini[5:7])
+    ult = calendar.monthrange(a, m)[1]
+    return dict(mes=ini[:7], rot=f"{_MES_PT[m - 1]}/{str(a)[2:]}", parcial=not (ini[8:] == "01" and int(fim[8:]) == ult),
+                ate=f"{fim[8:]}/{fim[5:7]}", dias=(datetime.strptime(fim, "%Y-%m-%d") - datetime.strptime(ini, "%Y-%m-%d")).days)
+
+
+def _melhor_por_mes(periodos):
+    """Só períodos dentro de um mesmo mês; se houver mais de um no mês, vale o mais longo (e o mais recente)."""
+    escolhidos, fora = {}, 0
+    for p in periodos:
+        if p["ini"][:7] != p["fim"][:7]:
+            fora += 1
+            continue
+        inf = _mes_info(p["ini"], p["fim"])
+        atual = escolhidos.get(inf["mes"])
+        if not atual or (inf["dias"], p["fim"]) > (atual[0]["dias"], atual[1]["fim"]):
+            escolhidos[inf["mes"]] = (inf, p)
+    return [escolhidos[k] for k in sorted(escolhidos)][-12:], fora
+
+
+def mkt_mensal(db, aba):
+    if aba == "lucro":
+        per = db.execute("SELECT ini, fim FROM (SELECT ini, fim FROM mkt_produtos UNION SELECT ini, fim FROM mkt_variantes)").fetchall()
+        esc, fora = _melhor_por_mes(per)
+        meses = []
+        for inf, p in esc:
+            _, T, _, _ = mkt_calcular(db, p["ini"], p["fim"])
+            meses.append(dict(rot=inf["rot"], parcial=inf["parcial"], ate=inf["ate"], vals=[T["receita"], T["lucro"]]))
+        aviso = "O lucro depende dos custos e das taxas cadastrados." + (f" {fora} período(s) que atravessam dois meses não entram no gráfico." if fora else "")
+        return dict(modo="group", series=["Faturamento", "Lucro"], cores=["#2563eb", "#059669"], meses=meses, aviso=aviso,
+                    vazio="Importe um relatório de vendas por produto ou por variante de um mês para ver o gráfico.")
+    per = db.execute("SELECT ini, fim FROM mkt_resumo GROUP BY ini, fim").fetchall()
+    esc, fora = _melhor_por_mes(per)
+    tot = {}
+    dados = []
+    for inf, p in esc:
+        vs = {r["loja"]: r["valor_validos"] for r in db.execute("SELECT loja, valor_validos FROM mkt_resumo WHERE ini=? AND fim=?", (p["ini"], p["fim"]))}
+        dados.append((inf, vs))
+        for l, v in vs.items():
+            tot[l] = tot.get(l, 0) + v
+    lojas = sorted(tot, key=lambda l: -tot[l])
+    meses = [(inf["mes"], dict(rot=inf["rot"], parcial=inf["parcial"], ate=inf["ate"], vals=[vs.get(l, 0) for l in lojas])) for inf, vs in dados]
+    # meses que só têm o relatório diário (sem divisão por loja)
+    tem = {m for m, _ in meses}
+    extra = []
+    for r in db.execute("SELECT substr(data,1,7) mes, SUM(valor_validos) v, MIN(data) a, MAX(data) b, COUNT(*) n FROM mkt_diario GROUP BY mes"):
+        if r["mes"] in tem:
+            continue
+        a_, m_ = int(r["mes"][:4]), int(r["mes"][5:7])
+        import calendar
+        completo = r["a"][8:] == "01" and int(r["b"][8:]) == calendar.monthrange(a_, m_)[1] and r["n"] == calendar.monthrange(a_, m_)[1]
+        extra.append((r["mes"], dict(rot=f"{_MES_PT[m_ - 1]}/{str(a_)[2:]}", parcial=not completo, ate=f"{r['b'][8:]}/{r['b'][5:7]}",
+                                     vals=[0] * len(lojas) + [r["v"] or 0])))
+    if extra:
+        lojas = lojas + ["Total (sem divisão por loja)"]
+        meses = [(m, dict(d, vals=d["vals"] + [0])) for m, d in meses] + extra
+    meses = [d for _, d in sorted(meses, key=lambda x: x[0])][-12:]
+    return dict(modo="stack", series=lojas, meses=meses,
+                aviso=(f"{fora} período(s) que atravessam dois meses não entram no gráfico." if fora else ""),
+                vazio="Importe o relatório “Vendas loja performance” de um mês para ver o gráfico.")
+
+
+def mkt_ranking(rows, T):
+    ordenados = sorted(rows, key=lambda g: -g["lucro"])
+    top = [g for g in ordenados if g["lucro"] > 0][:10]
+    prej = sorted((g for g in rows if g["lucro"] < 0), key=lambda g: g["lucro"])
+    maiores = sorted(rows, key=lambda g: -g["valor"])[:15]
+    baixa = [g for g in maiores if g["margem"] < T["margem"]]
+    fontes = []
+    for g in rows:
+        for f in g["fontes"]:
+            if f.get("_var"):
+                fontes.append(dict(f, pai=g["produto"]))
+    fontes.sort(key=lambda f: (-f["unidades"], -f["valor"]))
+    return dict(top=top, prejuizo=prej, baixa=baixa, margem_media=T["margem"], variacoes=fontes[:10],
+                sem_custo=sum(1 for g in rows if g["falta_custo"]))
+
+
+def mkt_dia(db, dm):
+    ms = [r["mes"] for r in db.execute("SELECT DISTINCT substr(data,1,7) mes FROM mkt_diario ORDER BY mes DESC")]
+    if not ms:
+        return dict(meses=[], dados=None)
+    sel = dm if dm in ms else ms[0]
+    rows = db.execute("SELECT * FROM mkt_diario WHERE substr(data,1,7)=? ORDER BY data", (sel,)).fetchall()
+    meses = [dict(mes=m, rot=f"{_MES_PT[int(m[5:7]) - 1]}/{m[2:4]}") for m in ms]
+    tv = sum(r["valor_validos"] for r in rows)
+    pv = sum(r["validos"] for r in rows)
+    melhor = max(rows, key=lambda r: r["valor_validos"])
+    resumo = (f"{len(rows)} dia(s) no relatório · vendas válidas {brl_txt(tv)} · {pv} pedidos · média de {brl_txt(tv // len(rows))} por dia · "
+              f"melhor dia {melhor['data'][8:]}/{melhor['data'][5:7]} ({brl_txt(melhor['valor_validos'])})")
+    dados = dict(modo="stack", series=["Vendas válidas", "Canceladas"], cores=["#2563eb", "#dc2626"],
+                 passoRot=1 if len(rows) <= 12 else 2, semTotal=True,
+                 meses=[dict(rot=f"{r['data'][8:]}/{r['data'][5:7]}", parcial=False, ate="", vals=[r["valor_validos"], r["valor_cancelados"]]) for r in rows],
+                 aviso="", vazio="")
+    return dict(meses=meses, sel=sel, dados=dados, resumo=resumo)
+
+
+def brl_txt(c):
+    return "R$ " + f"{c / 100:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+
+
+@app.route("/marketplaces/dados")
+def marketplaces_dados():
+    db = get_db()
+    resumo = []
+    for r in db.execute("SELECT substr(data,1,7) mes, MIN(data) a, MAX(data) b, COUNT(*) n FROM mkt_diario GROUP BY mes ORDER BY mes DESC"):
+        resumo.append(dict(tipo="Por dia", ini=r["a"], fim=r["b"], n=r["n"]))
+    for tipo, tb in (("Por loja", "mkt_resumo"), ("Por produto", "mkt_produtos"), ("Por variante", "mkt_variantes")):
+        for r in db.execute(f"SELECT ini, fim, COUNT(*) n FROM {tb} GROUP BY ini, fim ORDER BY fim DESC"):
+            resumo.append(dict(tipo=tipo, ini=r["ini"], fim=r["fim"], n=r["n"]))
+    return render_template("mkt_dados.html", titulo="Importar relatórios", resumo=resumo,
+                           n_cat=db.execute("SELECT COUNT(*) FROM mkt_catalogo").fetchone()[0])
+
+
+@app.route("/marketplaces/excluir", methods=["POST"])
+def marketplaces_excluir():
+    db = get_db()
+    db.execute("DELETE FROM mkt_resumo WHERE ini=? AND fim=?", (request.form.get("ini", ""), request.form.get("fim", "")))
+    db.commit()
+    flash("Período excluído.", "ok")
+    return redirect(url_for("marketplaces"))
+
+
+@app.route("/marketplaces")
+def marketplaces():
+    db = get_db()
+    periodos = db.execute("SELECT ini, fim FROM mkt_resumo GROUP BY ini, fim ORDER BY fim DESC, ini DESC").fetchall()
+    aba = request.args.get("aba") if request.args.get("aba") in ("lucro", "ranking") else "geral"
+    ctx = dict(titulo="Marketplaces", periodos=periodos, ini="", fim="", aba=aba, mensal=mkt_mensal(db, "lucro" if aba == "lucro" else "geral"), dia=None)
+    if aba == "geral":
+        ctx["dia"] = mkt_dia(db, request.args.get("dm", ""))
+    if aba in ("lucro", "ranking"):
+        lp = db.execute("""SELECT ini, fim FROM (SELECT ini, fim FROM mkt_produtos UNION SELECT ini, fim FROM mkt_variantes)
+                           ORDER BY fim DESC, ini DESC""").fetchall()
+        ctx["lp"] = lp
+        ctx["n_cat"] = db.execute("SELECT COUNT(*) FROM mkt_catalogo").fetchone()[0]
+        if lp:
+            ini, fim = lp[0]["ini"], lp[0]["fim"]
+            p = request.args.get("p", "")
+            if "|" in p and any(p == f"{x['ini']}|{x['fim']}" for x in lp):
+                ini, fim = p.split("|")
+            rows, T, lojas_t, ex = mkt_calcular(db, ini, fim)
+            dur = (datetime.strptime(fim, "%Y-%m-%d") - datetime.strptime(ini, "%Y-%m-%d")).days
+            A = None
+            for h in lp:
+                if h["fim"] < ini and (datetime.strptime(h["fim"], "%Y-%m-%d") - datetime.strptime(h["ini"], "%Y-%m-%d")).days == dur:
+                    _, A, _, _ = mkt_calcular(db, h["ini"], h["fim"])
+                    A.update(ini=h["ini"], fim=h["fim"])
+                    break
+            ctx.update(ini=ini, fim=fim, prods=rows, T=T, lojas_t=lojas_t, A=A, ex=ex)
+            if aba == "ranking":
+                ctx["rk"] = mkt_ranking(rows, T)
+    elif periodos:
+        ini, fim = periodos[0]["ini"], periodos[0]["fim"]
+        p = request.args.get("p", "")
+        if "|" in p and any(p == f"{x['ini']}|{x['fim']}" for x in periodos):
+            ini, fim = p.split("|")
+        lojas = [dict(r) for r in db.execute("SELECT * FROM mkt_resumo WHERE ini=? AND fim=? ORDER BY valor_validos DESC", (ini, fim))]
+        t = db.execute("""SELECT SUM(pedidos) pedidos, SUM(valor) valor, SUM(validos) validos, SUM(valor_validos) valor_validos,
+            SUM(cancelados) cancelados, SUM(valor_cancelados) valor_cancelados FROM mkt_resumo WHERE ini=? AND fim=?""", (ini, fim)).fetchone()
+        t = {k: (t[k] or 0) for k in t.keys()}
+        for r in lojas:
+            r["pct"] = r["valor_validos"] * 100.0 / t["valor_validos"] if t["valor_validos"] else 0
+        historico = db.execute("""SELECT ini, fim, SUM(validos) validos, SUM(valor_validos) valor_validos, SUM(cancelados) cancelados
+            FROM mkt_resumo GROUP BY ini, fim ORDER BY fim DESC, ini DESC""").fetchall()
+        # período anterior de mesma duração, se existir
+        dur = (datetime.strptime(fim, "%Y-%m-%d") - datetime.strptime(ini, "%Y-%m-%d")).days
+        ant = None
+        for h in historico:
+            if h["fim"] < ini and (datetime.strptime(h["fim"], "%Y-%m-%d") - datetime.strptime(h["ini"], "%Y-%m-%d")).days == dur:
+                ant = h
+                break
+        var = ((t["valor_validos"] - ant["valor_validos"]) * 100.0 / ant["valor_validos"]) if ant and ant["valor_validos"] else 0
+        ctx.update(ini=ini, fim=fim, lojas=lojas, t=t, historico=historico, ant=ant if ant and ant["valor_validos"] else None, var=var,
+                   ticket=(t["valor_validos"] // t["validos"]) if t["validos"] else 0,
+                   taxa=(t["cancelados"] * 100.0 / t["pedidos"]) if t["pedidos"] else 0)
+    return render_template("marketplaces.html", **ctx)
+
+
+# -------------------------------- Lista de compras -----------------------------
+@app.route("/compras")
+def compras():
+    db = get_db()
+    rows = []
+    for p in db.execute("SELECT * FROM produtos WHERE ativo=1 AND servico=0 AND estoque<=estoque_min ORDER BY nome"):
+        meta = max(2 * (p["estoque_min"] or 0), (p["estoque_min"] or 0) + 1)
+        sug = meta - (p["estoque"] or 0)
+        d = dict(p)
+        d["sugerida"] = round(max(sug, 1 if p["unidade"] == "un" else 0.001), 3)
+        if p["unidade"] == "un":
+            d["sugerida"] = int(-(-d["sugerida"] // 1))                 # unidade inteira, arredonda para cima
+        rows.append(d)
+    return render_template("compras.html", titulo="Lista de compras", rows=rows)
 
 
 # -------------------------------- Clientes -------------------------------
@@ -1633,8 +2891,10 @@ def clientes():
     q = request.args.get("q", "").strip()
     db = get_db()
     if q:
-        rows = db.execute("SELECT * FROM clientes WHERE nome LIKE ? OR telefone LIKE ? "
-                          "OR email LIKE ? ORDER BY nome", (f"%{q}%",) * 3).fetchall()
+        dig = re.sub(r"\D", "", q)
+        rows = db.execute("SELECT * FROM clientes WHERE nome LIKE ? OR telefone LIKE ? OR email LIKE ? "
+                          "OR (?<>'' AND documento_norm LIKE ?) ORDER BY nome",
+                          (f"%{q}%",) * 3 + (dig, f"%{dig}%")).fetchall()
     else:
         rows = db.execute("SELECT * FROM clientes ORDER BY nome").fetchall()
     return render_template("clientes.html", titulo="Clientes", rows=rows, q=q)
@@ -1678,9 +2938,19 @@ def cliente_form(cid=None):
             return render_template("cliente_form.html", titulo="Cliente", c=f, cid=cid)
         tel = f.get("telefone", "").strip()
         norm = norm_tel(tel)
+        doc, doc_norm, erro_doc = ler_documento(f.get("documento"))
+        if erro_doc:
+            flash(erro_doc, "erro")
+            return render_template("cliente_form.html", titulo="Cliente", c=f, cid=cid), 400
+        if doc_norm:
+            dono = db.execute("SELECT id, nome FROM clientes WHERE documento_norm=? AND id<>?",
+                              (doc_norm, cid or -1)).fetchone()
+            if dono:
+                flash(MSG_DOC_DUP + f" (cliente: {dono['nome']})", "erro")
+                return render_template("cliente_form.html", titulo="Cliente", c=f, cid=cid), 400
         dados = (nome, tel, f.get("email", "").strip(),
                  f.get("obs", "").strip(), f.get("cidade", "").strip(),
-                 f.get("endereco", "").strip(), norm)
+                 f.get("endereco", "").strip(), norm, doc, doc_norm)
 
         def telefone_repetido():
             if not norm or (c and norm_tel(c["telefone"]) == norm):   # o próprio cliente pode manter o seu
@@ -1694,16 +2964,16 @@ def cliente_form(cid=None):
         try:
             if cid:
                 db.execute("UPDATE clientes SET nome=?,telefone=?,email=?,obs=?,cidade=?,endereco=?,"
-                           "telefone_norm=? WHERE id=?", dados + (cid,))
+                           "telefone_norm=?,documento=?,documento_norm=? WHERE id=?", dados + (cid,))
             else:
                 cur = db.execute("INSERT INTO clientes(nome,telefone,email,obs,cidade,endereco,"
-                                 "telefone_norm,criado_em) VALUES(?,?,?,?,?,?,?,?)",
+                                 "telefone_norm,documento,documento_norm,criado_em) VALUES(?,?,?,?,?,?,?,?,?,?)",
                                  dados + (datetime.now().isoformat(" ", "seconds"),))
                 cid = cur.lastrowid
             db.commit()
-        except sqlite3.IntegrityError:      # gravação simultânea: a restrição do banco barra
+        except sqlite3.IntegrityError as e:      # gravação simultânea: a restrição do banco barra
             db.rollback()
-            flash(MSG_TEL_DUP, "erro")
+            flash(MSG_DOC_DUP if "documento" in str(e) else MSG_TEL_DUP, "erro")
             return render_template("cliente_form.html", titulo="Cliente", c=f, cid=cid), 400
         flash("Cliente salvo.", "ok")
         return redirect(url_for("cliente_ver", cid=cid))
@@ -1727,12 +2997,13 @@ def cliente_excluir(cid):
 # -------------------------------- Produtos -------------------------------
 def cats_existentes(db):
     """Categorias cadastradas (o formulário mostra as ativas e a atual do produto, se inativa)."""
-    return db.execute("SELECT id, nome, ativo FROM categorias_produto ORDER BY lower(nome)").fetchall()
+    return db.execute("SELECT id, nome, ativo, unidade FROM categorias_produto ORDER BY lower(nome)").fetchall()
 
 
 MSG_CAT_DUP = "Já existe uma categoria com esse nome."
 MSG_SKU_DUP = "Este SKU já está cadastrado em outro produto. Informe um código diferente."
 MSG_TEL_DUP = "Este telefone já está cadastrado para outro cliente. Verifique o cadastro existente."
+MSG_DOC_DUP = "Este CPF/CNPJ já está cadastrado para outro cliente. Verifique o cadastro existente."
 
 
 def nome_categoria(db, nome, ignorar=None):
@@ -1752,18 +3023,20 @@ def nome_categoria(db, nome, ignorar=None):
 def api_categorias_produto():
     db = get_db()
     if request.method == "POST":
-        nome, erro = nome_categoria(db, (request.get_json(silent=True) or {}).get("nome"))
+        dados = request.get_json(silent=True) or {}
+        nome, erro = nome_categoria(db, dados.get("nome"))
         if erro:
             return jsonify(ok=False, erro=erro), 400
+        un = dados.get("unidade") if dados.get("unidade") in UNIDADES else "un"
         try:
-            cur = db.execute("INSERT INTO categorias_produto(nome) VALUES(?)", (nome,))
+            cur = db.execute("INSERT INTO categorias_produto(nome, unidade) VALUES(?,?)", (nome, un))
             db.commit()
         except sqlite3.IntegrityError:
             db.rollback()
             return jsonify(ok=False, erro=MSG_CAT_DUP), 400
-        return jsonify(ok=True, id=cur.lastrowid, nome=nome)
+        return jsonify(ok=True, id=cur.lastrowid, nome=nome, unidade=un)
     return jsonify(categorias=[dict(r) for r in db.execute(
-        "SELECT id, nome FROM categorias_produto WHERE ativo=1 ORDER BY lower(nome)")])
+        "SELECT id, nome, unidade FROM categorias_produto WHERE ativo=1 ORDER BY lower(nome)")])
 
 
 @app.route("/produtos/categorias")
@@ -1782,12 +3055,26 @@ def categoria_nova():
         flash(erro, "erro")
     else:
         try:
-            db.execute("INSERT INTO categorias_produto(nome) VALUES(?)", (nome,))
+            un = request.form.get("unidade") if request.form.get("unidade") in UNIDADES else "un"
+            db.execute("INSERT INTO categorias_produto(nome, unidade) VALUES(?,?)", (nome, un))
             db.commit()
             flash("Categoria cadastrada.", "ok")
         except sqlite3.IntegrityError:
             db.rollback()
             flash(MSG_CAT_DUP, "erro")
+    return redirect(url_for("categorias_produto"))
+
+
+@app.route("/produtos/categorias/<int:cid>/unidade", methods=["POST"])
+def categoria_unidade(cid):
+    db = get_db()
+    un = request.form.get("unidade")
+    if un not in UNIDADES or not db.execute("SELECT 1 FROM categorias_produto WHERE id=?", (cid,)).fetchone():
+        flash("Unidade inválida.", "erro")
+    else:
+        db.execute("UPDATE categorias_produto SET unidade=? WHERE id=?", (un, cid))
+        db.commit()
+        flash("Unidade da categoria atualizada. Ela vale como padrão para novos produtos; os já cadastrados não mudam.", "ok")
     return redirect(url_for("categorias_produto"))
 
 
@@ -1872,17 +3159,69 @@ def duplicidades():
                            idx_sku="idx_prod_sku" in idx, idx_tel="idx_cli_tel" in idx)
 
 
+ORDENS_PROD = ("nome", "categoria", "codigo", "preco", "minimo", "estoque")
+
+
+def _txt_ord(t):
+    import unicodedata
+    return unicodedata.normalize("NFD", str(t or "").casefold()).encode("ascii", "ignore").decode()
+
+
+def _cod_ord(t):
+    """Código natural: números por valor (0002 antes de 0010), depois textos; sem código fica por último."""
+    t = str(t or "").strip()
+    if not t:
+        return None
+    return (0, int(t), "") if t.isdigit() else (1, 0, _txt_ord(t))
+
+
+def ordenar_produtos(rows, ordem, desc):
+    def chave(r):
+        if ordem == "nome":
+            return _txt_ord(r["nome"])
+        if ordem == "categoria":
+            return _txt_ord(r["categoria"]) or None
+        if ordem == "codigo":
+            return _cod_ord(r["sku"])
+        if ordem == "preco":
+            return r["preco"]
+        if ordem == "minimo":
+            return r["minimo"] or None
+        return None if r["servico"] else r["estoque"]          # estoque: serviço não controla
+    com = [r for r in rows if chave(r) is not None]
+    sem = [r for r in rows if chave(r) is None]                 # vazios ficam sempre no fim
+    desempate = lambda r: (_txt_ord(r["nome"]), r["id"])
+    com.sort(key=desempate)
+    com.sort(key=chave, reverse=desc)
+    sem.sort(key=desempate)
+    return com + sem
+
+
 @app.route("/produtos")
 def produtos():
     q = request.args.get("q", "").strip()
     db = get_db()
     if q:
-        rows = db.execute("SELECT * FROM produtos WHERE ativo=1 AND (nome LIKE ? OR sku LIKE ?) "
-                          "ORDER BY nome", (f"%{q}%",) * 2).fetchall()
+        rows = db.execute("SELECT * FROM produtos WHERE ativo=1 AND (nome LIKE ? OR sku LIKE ?)",
+                          (f"%{q}%",) * 2).fetchall()
     else:
-        rows = db.execute("SELECT * FROM produtos WHERE ativo=1 ORDER BY nome").fetchall()
+        rows = db.execute("SELECT * FROM produtos WHERE ativo=1").fetchall()
+    # ordenação pelos cabeçalhos da tabela (padrão: por código, do menor para o maior)
+    ordem = request.args.get("o", "codigo")
+    if ordem not in ORDENS_PROD:
+        ordem = "codigo"
+    desc = request.args.get("d") == "desc"
+    rows = ordenar_produtos(rows, ordem, desc)
+    por = inteiro(request.args.get("n"), 50)
+    por = por if por in (50, 100, 200) else 50
+    total = len(rows)
+    paginas = max(1, -(-total // por))
+    pg = min(max(inteiro(request.args.get("pg"), 1), 1), paginas)
+    rows = rows[(pg - 1) * por: pg * por]
     # os custos NÃO são enviados nesta página: só vêm de /api/produtos/custos ao clicar em "Mostrar custos"
-    return render_template("produtos.html", titulo="Produtos", rows=rows, q=q)
+    return render_template("produtos.html", titulo="Produtos", rows=rows, q=q, ordem=ordem, desc=desc,
+                           pg=pg, paginas=paginas, por=por, total=total,
+                           de=(pg - 1) * por + 1 if total else 0, ate=min(pg * por, total))
 
 
 @app.route("/api/produtos/custos")
@@ -2000,6 +3339,20 @@ def produto_form(pid=None):
         return redirect(url_for("produtos"))
     return render_template("produto_form.html", titulo="Produto", p=p, pid=pid,
                            cats=cats_existentes(db), sku_sug=None if pid else proximo_sku(db))
+
+
+@app.route("/produtos/<int:pid>/duplicar")
+def produto_duplicar(pid):
+    """Abre o formulário de novo produto já preenchido com os dados do original. Só o código muda
+    (próximo do contador) e o estoque começa em zero; nada é gravado até clicar em Salvar."""
+    db = get_db()
+    p = db.execute("SELECT * FROM produtos WHERE id=?", (pid,)).fetchone()
+    if not p:
+        abort(404)
+    d = dict(p)
+    d["sku"], d["estoque"] = None, 0
+    return render_template("produto_form.html", titulo="Duplicar produto", p=d, pid=None, dup=True,
+                           cats=cats_existentes(db), sku_sug=proximo_sku(db))
 
 
 def proximo_sku(db):
@@ -2601,8 +3954,8 @@ def api_salvar():
             db.execute("DELETE FROM orc_linhas WHERE orcamento_id=?", (oid,))
         else:
             cur = db.execute("INSERT INTO orcamentos(cliente_id,titulo,data,perda,desconto,total,"
-                             "prazo,obs,desconto_tipo,desconto_valor,entrega,vendedor,token) "
-                             "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)", cab + (token,))
+                             "prazo,obs,desconto_tipo,desconto_valor,entrega,vendedor,token,status) "
+                             "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,'orcamento')", cab + (token,))
             oid = cur.lastrowid
         gravar_linhas(db, oid, raws)
         if o and o["status"] == "concluido":          # venda já contabilizada: ajusta, não duplica
@@ -2656,6 +4009,115 @@ def montar_msg_avaliacao(db, o):
 def _orc_aval(db, oid):
     return db.execute("SELECT o.*, c.nome cliente, c.telefone FROM orcamentos o JOIN clientes c ON c.id=o.cliente_id "
                       "WHERE o.id=? AND o.status='concluido'", (oid,)).fetchone()
+
+
+# -------------------------------- Orçamentos parados (follow-up) ---------------
+MSG_FOLLOWUP_PADRAO = ("Olá, {nome}! Aqui é da {empresa}. Passando para saber se você conseguiu ver o orçamento "
+                       "nº {os} ({valor}). Qualquer dúvida ou ajuste, é só me chamar! 😊")
+
+
+def followup_dias(db):
+    d = inteiro(cfg_get(db, "fu_dias", "3"), 3)
+    return d if 1 <= d <= 90 else 3
+
+
+def _followup_lista(db):
+    """Orçamentos em aberto com a situação do lembrete. Devolve lista de dicts."""
+    hoje = datetime.now().date()
+    dias = followup_dias(db)
+    res = []
+    for r in db.execute("SELECT o.id, o.titulo, o.total, o.data, o.followup_em, o.followup_off, c.nome cliente, c.telefone "
+                        "FROM orcamentos o JOIN clientes c ON c.id=o.cliente_id WHERE o.status='orcamento' ORDER BY o.data"):
+        d = dict(r)
+        try:
+            criado = datetime.strptime(r["data"][:10], "%Y-%m-%d").date()
+        except (TypeError, ValueError):
+            continue
+        ref = criado
+        if r["followup_em"]:
+            try:
+                ref = max(ref, datetime.strptime(r["followup_em"][:10], "%Y-%m-%d").date())
+            except ValueError:
+                pass
+        d["dias"] = (hoje - criado).days
+        d["devido"] = (not r["followup_off"]) and (hoje - ref).days >= dias
+        res.append(d)
+    return res
+
+
+def montar_msg_followup(db, o):
+    modelo = cfg_get(db, "fu_msg", "") or MSG_FOLLOWUP_PADRAO
+    nome = (o["cliente"] or "").strip().split(" ")[0].title() or "tudo bem"
+    return (modelo.replace("{nome}", nome).replace("{empresa}", empresa_dados(db)["nome"])
+            .replace("{os}", f"{o['id']:04d}").replace("{valor}", brl(o["total"])))
+
+
+@app.route("/orcamentos/followup")
+def followup():
+    db = get_db()
+    todos = _followup_lista(db)
+    filtros = {"pendentes": lambda r: r["devido"], "lembrados": lambda r: bool(r["followup_em"]) and not r["followup_off"],
+               "dispensados": lambda r: bool(r["followup_off"]), "todos": lambda r: True}
+    aba = request.args.get("aba") if request.args.get("aba") in filtros else "pendentes"
+    rows = sorted((r for r in todos if filtros[aba](r)), key=lambda r: -r["dias"])
+    return render_template("followup.html", titulo="Orçamentos parados", rows=rows, aba=aba,
+                           cont={k: sum(1 for r in todos if f(r)) for k, f in filtros.items()},
+                           dias=followup_dias(db), modelo=cfg_get(db, "fu_msg", "") or MSG_FOLLOWUP_PADRAO,
+                           numero_whatsapp=numero_whatsapp)
+
+
+@app.route("/orcamentos/followup/config", methods=["POST"])
+def followup_config():
+    db = get_db()
+    dias = inteiro(request.form.get("dias"), 0)
+    msg = request.form.get("msg", "").replace("\r", "").strip()
+    if not 1 <= dias <= 90:
+        flash("Informe de 1 a 90 dias.", "erro")
+    elif len(msg) > 800:
+        flash("A mensagem passa de 800 caracteres.", "erro")
+    else:
+        cfg_set(db, "fu_dias", str(dias))
+        cfg_set(db, "fu_msg", "" if msg == MSG_FOLLOWUP_PADRAO else msg)
+        db.commit()
+        flash("Configuração salva.", "ok")
+    return redirect(url_for("followup"))
+
+
+def _orc_followup(db, oid):
+    return db.execute("SELECT o.*, c.nome cliente, c.telefone FROM orcamentos o JOIN clientes c ON c.id=o.cliente_id "
+                      "WHERE o.id=? AND o.status='orcamento'", (oid,)).fetchone()
+
+
+@app.route("/orcamentos/<int:oid>/followup/enviar", methods=["POST"])
+def followup_enviar(oid):
+    db = get_db()
+    o = _orc_followup(db, oid)
+    if not o:
+        abort(404)
+    num = numero_whatsapp(o["telefone"])
+    if not num:
+        flash(f"O cliente {o['cliente']} não tem um telefone válido cadastrado.", "erro")
+        return redirect(url_for("followup"))
+    db.execute("UPDATE orcamentos SET followup_em=? WHERE id=?", (agora_txt(), oid))
+    db.commit()
+    from urllib.parse import quote
+    return redirect(f"https://wa.me/{num}?text={quote(montar_msg_followup(db, o))}")
+
+
+@app.route("/orcamentos/<int:oid>/followup/estado", methods=["POST"])
+def followup_estado(oid):
+    db = get_db()
+    if not _orc_followup(db, oid):
+        abort(404)
+    acao = request.form.get("acao")
+    if acao == "lembrado":
+        db.execute("UPDATE orcamentos SET followup_em=? WHERE id=?", (agora_txt(), oid))
+    elif acao == "dispensar":
+        db.execute("UPDATE orcamentos SET followup_off=1 WHERE id=?", (oid,))
+    elif acao == "pendente":
+        db.execute("UPDATE orcamentos SET followup_off=0 WHERE id=?", (oid,))
+    db.commit()
+    return redirect(url_for("followup", aba=request.args.get("aba") or "pendentes"))
 
 
 @app.route("/avaliacoes")
@@ -2748,7 +4210,32 @@ def orcamento_ver(oid):
         comps[c["linha_id"]].append(c)
     subtotal = sum(l["total"] for l in linhas)
     return render_template("orcamento_ver.html", titulo=f"Orçamento #{oid}", o=o, linhas=linhas,
-                           comps=comps, subtotal=subtotal)
+                           desc_l=desconto_por_linha(db, oid, linhas, o["desconto"]),
+                           comps=comps, subtotal=subtotal, pag=resumo_pagamentos(db, oid),
+                           formas=FORMAS_PAG, hoje=f"{datetime.now():%Y-%m-%d}")
+
+
+def desconto_por_linha(db, oid, linhas, desconto):
+    """Desconto de cada item (centavos), somando exatamente o desconto do orçamento.
+    Usa o rateio gravado nos componentes; orçamentos antigos (sem rateio) dividem proporcional ao valor."""
+    rat = {r["linha_id"]: r["d"] for r in db.execute(
+        "SELECT linha_id, SUM(desc_rateio) d FROM orcamento_itens WHERE orcamento_id=? GROUP BY linha_id", (oid,))}
+    res = {l["id"]: int(rat.get(l["id"]) or 0) for l in linhas}
+    if not desconto:
+        return {k: 0 for k in res}
+    if sum(res.values()) == desconto:
+        return res
+    total = sum(l["total"] for l in linhas)
+    if total <= 0:
+        return {k: 0 for k in res}
+    res = {l["id"]: desconto * l["total"] // total for l in linhas}
+    resto = desconto - sum(res.values())
+    for l in sorted(linhas, key=lambda l: (-(desconto * l["total"] % total), l["id"])):
+        if resto <= 0:
+            break
+        res[l["id"]] += 1
+        resto -= 1
+    return res
 
 
 @app.route("/orcamentos/<int:oid>/imprimir")
@@ -2775,8 +4262,82 @@ def orcamento_imprimir(oid):
         peso += 1 + (1 if len(txt) + len(l["nome"] or "") > 75 else 0) + (1 if l["descricao"] else 0)
     cabe = peso <= 7 and len(o["obs"] or "") <= 240
     return render_template("imprimir.html", titulo=f"Orçamento {oid:04d}", o=o, linhas=linhas, comps=comps,
+                           desc_l=desconto_por_linha(db, oid, linhas, o["desconto"]),
                            subtotal=sum(l["total"] for l in linhas), modo=modo, cabe=cabe,
+                           pag=resumo_pagamentos(db, oid),
                            auto=request.args.get("auto") == "1")
+
+
+FORMAS_PAG = ("Dinheiro", "Pix", "Cartão", "Transferência", "Boleto", "Outro")
+
+
+def resumo_pagamentos(db, oid):
+    o = db.execute("SELECT total FROM orcamentos WHERE id=?", (oid,)).fetchone()
+    itens = db.execute("SELECT * FROM pagamentos WHERE orcamento_id=? ORDER BY data, id", (oid,)).fetchall()
+    pago = sum(p["valor"] for p in itens)
+    total = o["total"] if o else 0
+    return {"itens": itens, "pago": pago, "total": total, "saldo": max(total - pago, 0)}
+
+
+def sincronizar_recebimento(db, oid):
+    """Venda do serviço com pagamentos: 'recebida' só quando o total foi pago (data do último pagamento)."""
+    v = db.execute("SELECT id, total FROM vendas WHERE orcamento_id=? AND status='ativa'", (oid,)).fetchone()
+    if not v:
+        return
+    r = db.execute("SELECT COALESCE(SUM(valor),0) pago, MAX(data) ultimo, COUNT(*) n FROM pagamentos "
+                   "WHERE orcamento_id=?", (oid,)).fetchone()
+    if not r["n"]:
+        return
+    db.execute("UPDATE vendas SET recebido_em=? WHERE id=?",
+               (r["ultimo"] if r["pago"] >= v["total"] else None, v["id"]))
+
+
+@app.route("/orcamentos/<int:oid>/pagamentos", methods=["POST"])
+def pagamento_novo(oid):
+    db = get_db()
+    o = db.execute("SELECT status, total FROM orcamentos WHERE id=?", (oid,)).fetchone()
+    if not o:
+        abort(404)
+    volta = url_for("orcamento_ver", oid=oid) + "#pagamentos"
+    if o["status"] not in ("aprovado", "producao", "concluido"):
+        flash("Só dá para registrar pagamento de serviço aprovado.", "erro")
+        return redirect(volta)
+    valor = para_centavos(request.form.get("valor"))
+    data = request.form.get("data", "").strip()
+    forma = request.form.get("forma", "Outro")
+    try:
+        datetime.strptime(data, "%Y-%m-%d")
+    except ValueError:
+        flash("Informe a data do pagamento.", "erro")
+        return redirect(volta)
+    saldo = resumo_pagamentos(db, oid)["saldo"]
+    if valor is None or valor <= 0:
+        flash("Informe um valor maior que zero.", "erro")
+    elif valor > saldo:
+        flash(f"O valor passa do saldo a receber ({brl(saldo)}).", "erro")
+    else:
+        db.execute("INSERT INTO pagamentos(orcamento_id,valor,data,forma,obs,criado_em) VALUES(?,?,?,?,?,?)",
+                   (oid, valor, data, forma if forma in FORMAS_PAG else "Outro",
+                    request.form.get("obs", "").strip()[:120], agora_txt()))
+        sincronizar_recebimento(db, oid)
+        db.commit()
+        flash(f"Pagamento de {brl(valor)} registrado.", "ok")
+    return redirect(volta)
+
+
+@app.route("/orcamentos/<int:oid>/pagamentos/<int:pid>/excluir", methods=["POST"])
+def pagamento_excluir(oid, pid):
+    db = get_db()
+    db.execute("DELETE FROM pagamentos WHERE id=? AND orcamento_id=?", (pid, oid))
+    v = db.execute("SELECT id FROM vendas WHERE orcamento_id=? AND status='ativa'", (oid,)).fetchone()
+    if v:
+        if db.execute("SELECT 1 FROM pagamentos WHERE orcamento_id=?", (oid,)).fetchone():
+            sincronizar_recebimento(db, oid)
+        else:
+            db.execute("UPDATE vendas SET recebido_em=NULL WHERE id=?", (v["id"],))
+    db.commit()
+    flash("Pagamento excluído.", "ok")
+    return redirect(url_for("orcamento_ver", oid=oid) + "#pagamentos")
 
 
 # ---- venda gerada pelo orçamento Concluído (uma única vez por orçamento) ----
@@ -2850,6 +4411,7 @@ def registrar_venda(db, oid, quando=None, origem=None):
         evento_venda(db, vid, "concluida", None, o["total"], origem, quando)
         resultado = "criada"
     gravar_custos(db, vid, itens)
+    sincronizar_recebimento(db, oid)
     return resultado
 
 
@@ -2864,11 +4426,13 @@ def atualizar_venda(db, oid):
     novo = (o["cliente_id"], o["total"], bruto, o["desconto"], cpv, pend)
     if novo == (v["cliente_id"], v["total"], v["valor_bruto"], v["desconto"], v["cpv"],
                 v["cpv_pendentes"]):
+        sincronizar_recebimento(db, oid)
         return
     db.execute("UPDATE vendas SET cliente_id=?, total=?, valor_bruto=?, desconto=?, cpv=?, "
                "cpv_pendentes=? WHERE id=?", novo + (v["id"],))
     gravar_custos(db, v["id"], itens)
     evento_venda(db, v["id"], "ajustada", v["total"], o["total"], "orçamento editado")
+    sincronizar_recebimento(db, oid)
 
 
 def estornar_venda(db, oid, motivo):
@@ -2944,7 +4508,7 @@ def orcamento_duplicar(oid):
         abort(404)
     cur = db.execute(
         "INSERT INTO orcamentos(cliente_id,titulo,data,med_l,med_a,med_p,perda,desconto,total,"
-        "prazo,obs,desconto_tipo,desconto_valor,vendedor) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        "prazo,obs,desconto_tipo,desconto_valor,vendedor,status) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,'orcamento')",
         (o["cliente_id"], ((o["titulo"] or "") + " (cópia)").strip(),
          datetime.now().isoformat(" ", "seconds"), o["med_l"], o["med_a"], o["med_p"],
          o["perda"], o["desconto"], o["total"], o["prazo"], o["obs"], o["desconto_tipo"],
@@ -3088,7 +4652,8 @@ def venda_ver(vid):
     orc_existe = bool(v["orcamento_id"] and db.execute(
         "SELECT 1 FROM orcamentos WHERE id=?", (v["orcamento_id"],)).fetchone())
     eventos = db.execute("SELECT * FROM venda_eventos WHERE venda_id=? ORDER BY id", (vid,)).fetchall()
-    return render_template("venda_ver.html", titulo=f"Venda #{vid}", v=v, itens=itens,
+    pag = resumo_pagamentos(db, v["orcamento_id"]) if orc_existe else None
+    return render_template("venda_ver.html", titulo=f"Venda #{vid}", v=v, itens=itens, pag=pag,
                            linhas=linhas, orc_existe=orc_existe, eventos=eventos,
                            hoje=datetime.now().strftime("%Y-%m-%d"))
 
@@ -3131,6 +4696,9 @@ def venda_recebimento(vid):
         abort(404)
     if v["status"] != "ativa":
         flash("Venda cancelada não recebe pagamento.", "erro")
+        return redirect(url_for("venda_ver", vid=vid))
+    if db.execute("SELECT 1 FROM vendas v JOIN pagamentos p ON p.orcamento_id=v.orcamento_id WHERE v.id=?", (vid,)).fetchone():
+        flash("Esta venda tem pagamentos registrados no serviço; use a área Pagamentos do orçamento.", "erro")
         return redirect(url_for("venda_ver", vid=vid))
     if request.form.get("desfazer"):
         db.execute("UPDATE vendas SET recebido_em=NULL WHERE id=?", (vid,))
@@ -3213,6 +4781,317 @@ def agenda_excluir(aid):
 
 
 # --------------------------------- Backup --------------------------------
+# -------------------------------- Senha de acesso -----------------------------
+_tentativas = {}
+
+
+def carregar_segredo():
+    """Chave das sessões guardada no banco (o login sobrevive a reinicializações) e recuperação de senha."""
+    import secrets
+    con = sqlite3.connect(DB_PATH)
+    try:
+        con.execute("CREATE TABLE IF NOT EXISTS config(chave TEXT PRIMARY KEY, valor TEXT)")
+        r = con.execute("SELECT valor FROM config WHERE chave='app_secret'").fetchone()
+        if not r:
+            novo = secrets.token_hex(32)
+            con.execute("INSERT INTO config(chave,valor) VALUES('app_secret',?)", (novo,))
+            r = (novo,)
+        app.secret_key = r[0]
+        sinal = os.path.join(PASTA, "REMOVER_SENHA.txt")
+        if os.path.exists(sinal):
+            con.execute("DELETE FROM config WHERE chave='senha_hash'")
+            try:
+                os.remove(sinal)
+            except OSError:
+                pass
+        con.commit()
+    finally:
+        con.close()
+
+
+def _senha_hash(db):
+    r = db.execute("SELECT valor FROM config WHERE chave='senha_hash'").fetchone()
+    return r["valor"] if r and r["valor"] else ""
+
+
+@app.before_request
+def exigir_login():
+    if request.endpoint in ("static", "login", None):
+        return
+    try:
+        if _senha_hash(get_db()) and not session.get("ok"):
+            return redirect(url_for("login", next=request.full_path.rstrip("?") if request.method == "GET" else ""))
+    except sqlite3.Error:
+        return
+
+
+def _proximo_seguro(p):
+    return p if p and p.startswith("/") and not p.startswith("//") else url_for("dashboard")
+
+
+@app.route("/login", methods=["GET", "POST"])
+def login():
+    db = get_db()
+    h = _senha_hash(db)
+    if not h:
+        return redirect(url_for("dashboard"))
+    prox = _proximo_seguro(request.values.get("next", ""))
+    if request.method == "POST":
+        ip = request.remote_addr or "?"
+        n, ate = _tentativas.get(ip, (0, 0))
+        import time
+        if ate > time.time():
+            flash(f"Muitas tentativas. Aguarde {int(ate - time.time()) + 1} segundos.", "erro")
+        elif check_password_hash(h, request.form.get("senha", "")):
+            _tentativas.pop(ip, None)
+            session.clear()
+            session["ok"] = True
+            session.permanent = bool(request.form.get("manter"))
+            return redirect(prox)
+        else:
+            n += 1
+            _tentativas[ip] = (n, time.time() + 30 if n >= 5 else 0)
+            if n >= 5:
+                _tentativas[ip] = (0, time.time() + 30)
+            flash("Senha incorreta.", "erro")
+    return render_template("login.html", proximo=prox)
+
+
+@app.route("/sair")
+def sair():
+    session.clear()
+    return redirect(url_for("login"))
+
+
+@app.route("/seguranca")
+def seguranca():
+    return render_template("seguranca.html", titulo="Segurança", tem_senha=bool(_senha_hash(get_db())))
+
+
+@app.route("/seguranca/salvar", methods=["POST"])
+def seguranca_salvar():
+    db = get_db()
+    h = _senha_hash(db)
+    nova, nova2 = request.form.get("nova", ""), request.form.get("nova2", "")
+    if h and not check_password_hash(h, request.form.get("atual", "")):
+        flash("A senha atual está incorreta.", "erro")
+    elif len(nova) < 4:
+        flash("A senha precisa ter pelo menos 4 caracteres.", "erro")
+    elif nova != nova2:
+        flash("As duas senhas digitadas são diferentes.", "erro")
+    else:
+        cfg_set(db, "senha_hash", generate_password_hash(nova)); db.commit()
+        session["ok"] = True
+        flash("Senha salva. A partir de agora o sistema pede a senha ao abrir.", "ok")
+    return redirect(url_for("seguranca"))
+
+
+@app.route("/seguranca/remover", methods=["POST"])
+def seguranca_remover():
+    db = get_db()
+    h = _senha_hash(db)
+    if h and check_password_hash(h, request.form.get("atual", "")):
+        db.execute("DELETE FROM config WHERE chave='senha_hash'"); db.commit()
+        flash("Senha removida.", "ok")
+    else:
+        flash("A senha atual está incorreta.", "erro")
+    return redirect(url_for("seguranca"))
+
+
+# -------------------------------- Backups -----------------------------
+PASTA_BACKUPS = os.path.join(PASTA, "backups")
+MANTER_BACKUPS = 30
+_backup_dia = {"d": None}
+
+
+def _copiar_banco(destino):
+    src = sqlite3.connect(DB_PATH)
+    dst = sqlite3.connect(destino)
+    try:
+        src.backup(dst)
+    finally:
+        dst.close(); src.close()
+
+
+def _status_extra(ok, arquivo="", erro=""):
+    """Guarda o resultado da última cópia extra (a página Backups e o Início mostram)."""
+    try:
+        import json
+        con = sqlite3.connect(DB_PATH)
+        con.execute("INSERT INTO config(chave,valor) VALUES('backup_extra_status',?) ON CONFLICT(chave) DO UPDATE SET valor=excluded.valor",
+                    (json.dumps({"ok": ok, "quando": f"{datetime.now():%Y-%m-%d %H:%M}", "arquivo": arquivo, "erro": erro}),))
+        con.commit()
+        con.close()
+    except Exception:
+        pass
+
+
+def _copiar_extra(destino, nome):
+    """Copia o backup para a pasta extra (se configurada), mantém só os mais recentes lá e registra o resultado."""
+    try:
+        con = sqlite3.connect(DB_PATH)
+        r = con.execute("SELECT valor FROM config WHERE chave='backup_extra'").fetchone()
+        con.close()
+    except Exception:
+        return
+    pasta = r[0] if r and r[0] else ""
+    if not pasta:
+        return
+    try:
+        if not os.path.isdir(pasta):
+            raise OSError("a pasta não foi encontrada (o Google Drive/pendrive está conectado?)")
+        import shutil
+        shutil.copy2(destino, os.path.join(pasta, nome))
+        for pref in ("auto", "manual"):
+            arqs = sorted(f for f in os.listdir(pasta) if re.fullmatch(pref + r"_\d{8}_\d{6}\.db", f))
+            for velho in arqs[:-MANTER_BACKUPS]:
+                try:
+                    os.remove(os.path.join(pasta, velho))
+                except OSError:
+                    pass
+        _status_extra(True, nome)
+    except Exception as e:
+        _status_extra(False, nome, str(e)[:200])
+
+
+def estado_backup(db):
+    """Situação do backup para a página Backups e o aviso do Início."""
+    import json
+    extra = cfg_get(db, "backup_extra", "")
+    try:
+        st = json.loads(cfg_get(db, "backup_extra_status", "") or "{}")
+    except ValueError:
+        st = {}
+    antigo = False
+    if st.get("ok") and st.get("quando"):
+        try:
+            antigo = (datetime.now() - datetime.strptime(st["quando"], "%Y-%m-%d %H:%M")).days >= 3
+        except ValueError:
+            pass
+    aviso = ""
+    if not extra and cfg_get(db, "backup_aviso_off", "") != "1":
+        aviso = "sem_extra"
+    elif extra and (not os.path.isdir(extra) or st.get("ok") is False):
+        aviso = "falha"
+    elif extra and antigo:
+        aviso = "antigo"
+    return dict(extra=extra, st=st, aviso=aviso, pasta_ok=bool(extra) and os.path.isdir(extra))
+
+
+def fazer_backup(prefixo="auto"):
+    """Copia o banco para backups/ (e para a pasta extra, se houver). Devolve o caminho ou None."""
+    try:
+        os.makedirs(PASTA_BACKUPS, exist_ok=True)
+        nome = f"{prefixo}_{datetime.now():%Y%m%d_%H%M%S}.db"
+        destino = os.path.join(PASTA_BACKUPS, nome)
+        _copiar_banco(destino)
+        for pref in ("auto", "manual"):                       # guarda só os mais recentes de cada tipo
+            arqs = sorted(f for f in os.listdir(PASTA_BACKUPS) if f.startswith(pref + "_") and f.endswith(".db"))
+            for velho in arqs[:-MANTER_BACKUPS]:
+                try:
+                    os.remove(os.path.join(PASTA_BACKUPS, velho))
+                except OSError:
+                    pass
+        _copiar_extra(destino, nome)
+        return destino
+    except Exception:
+        return None
+
+
+@app.before_request
+def backup_do_dia():
+    hoje = f"{datetime.now():%Y%m%d}"
+    if _backup_dia["d"] == hoje or request.endpoint == "static":
+        return
+    _backup_dia["d"] = hoje
+    try:
+        existe = os.path.isdir(PASTA_BACKUPS) and any(
+            f.startswith(f"auto_{hoje}") for f in os.listdir(PASTA_BACKUPS))
+    except OSError:
+        existe = False
+    if not existe:
+        fazer_backup("auto")
+
+
+@app.route("/backups")
+def backups():
+    db = get_db()
+    arqs = []
+    if os.path.isdir(PASTA_BACKUPS):
+        for f in sorted(os.listdir(PASTA_BACKUPS), reverse=True):
+            if f.endswith(".db") and f.split("_")[0] in ("auto", "manual"):
+                st = os.stat(os.path.join(PASTA_BACKUPS, f))
+                arqs.append({"nome": f, "kb": max(1, st.st_size // 1024),
+                             "data": datetime.fromtimestamp(st.st_mtime).strftime("%d/%m/%Y %H:%M")})
+    extra = cfg_get(db, "backup_extra", "")
+    return render_template("backups.html", titulo="Backups", arqs=arqs, extra=extra,
+                           extra_ok=bool(extra) and os.path.isdir(extra), manter=MANTER_BACKUPS,
+                           est=estado_backup(db))
+
+
+@app.route("/backups/agora", methods=["POST"])
+def backup_agora():
+    if not fazer_backup("manual"):
+        flash("Não consegui fazer o backup.", "erro")
+    else:
+        est = estado_backup(get_db())
+        if est["extra"] and est["st"].get("ok") is False:
+            flash("Backup feito neste computador, mas a cópia extra falhou: " + est["st"].get("erro", ""), "erro")
+        elif est["extra"]:
+            flash("Backup feito e copiado também para a pasta extra.", "ok")
+        else:
+            flash("Backup feito (somente neste computador; configure uma pasta extra para ter uma segunda cópia).", "ok")
+    return redirect(url_for("backups"))
+
+
+@app.route("/backups/testar", methods=["POST"])
+def backup_testar():
+    pasta = cfg_get(get_db(), "backup_extra", "")
+    if not pasta:
+        flash("Informe e salve a pasta extra primeiro.", "erro")
+    else:
+        try:
+            if not os.path.isdir(pasta):
+                raise OSError("a pasta não foi encontrada")
+            alvo = os.path.join(pasta, f"_teste_{uuid.uuid4().hex[:8]}.tmp")
+            with open(alvo, "w") as fh:
+                fh.write("ok")
+            os.remove(alvo)
+            flash("Pasta extra funcionando: consegui gravar e apagar um arquivo de teste.", "ok")
+        except Exception as e:
+            flash(f"Não consegui gravar na pasta extra: {e}", "erro")
+    return redirect(url_for("backups"))
+
+
+@app.route("/backups/dispensar-aviso", methods=["POST"])
+def backup_dispensar_aviso():
+    db = get_db()
+    cfg_set(db, "backup_aviso_off", "1")
+    db.commit()
+    return redirect(url_for("dashboard"))
+
+
+@app.route("/backups/config", methods=["POST"])
+def backup_config():
+    db = get_db()
+    pasta = request.form.get("pasta", "").strip().strip('"')
+    cfg_set(db, "backup_extra", pasta); db.commit()
+    flash("Pasta extra salva." if pasta else "Cópia extra desativada.", "ok")
+    if pasta and not os.path.isdir(pasta):
+        flash("Atenção: essa pasta não existe neste computador.", "erro")
+    return redirect(url_for("backups"))
+
+
+@app.route("/backups/baixar/<nome>")
+def backup_baixar(nome):
+    if not re.fullmatch(r"(auto|manual)_\d{8}_\d{6}\.db", nome):
+        abort(404)
+    caminho = os.path.join(PASTA_BACKUPS, nome)
+    if not os.path.isfile(caminho):
+        abort(404)
+    return send_file(caminho, as_attachment=True, download_name=nome)
+
+
 @app.route("/backup")
 def backup():
     copia = os.path.join(PASTA, "backup_temp.db")
@@ -3239,6 +5118,30 @@ def cnpj_valido(d):
         if int(d[n]) != (0 if dv < 2 else 11 - dv):
             return False
     return True
+
+
+def cpf_valido(d):
+    if len(d) != 11 or d == d[0] * 11:
+        return False
+    for n in (9, 10):
+        dv = sum(int(c) * p for c, p in zip(d[:n], range(n + 1, 1, -1))) * 10 % 11 % 10
+        if int(d[n]) != dv:
+            return False
+    return True
+
+
+def ler_documento(txt):
+    """CPF ou CNPJ opcional. Devolve (formatado, só_dígitos, erro). Em branco = sem documento."""
+    d = re.sub(r"\D", "", txt or "")
+    if not d:
+        return "", None, None
+    if len(d) == 11 and cpf_valido(d):
+        return f"{d[:3]}.{d[3:6]}.{d[6:9]}-{d[9:]}", d, None
+    if len(d) == 14 and cnpj_valido(d):
+        return mascara_cnpj(d), d, None
+    if len(d) not in (11, 14):
+        return "", None, "CPF/CNPJ incompleto: o CPF tem 11 números e o CNPJ tem 14."
+    return "", None, "CPF/CNPJ inválido: confira os números digitados."
 
 
 def mascara_cnpj(d):
@@ -3361,13 +5264,21 @@ BASE = r"""<!doctype html>
 body{margin:0;font:15px/1.5 system-ui,"Segoe UI",sans-serif;background:var(--bg);color:var(--tx)}
 .side{position:fixed;left:0;top:0;bottom:0;width:224px;background:#0f172a;padding:14px 12px;display:flex;flex-direction:column;gap:2px;overflow:auto;z-index:20}
 .side .brand{color:#fff;font-weight:700;font-size:18px;padding:8px 10px 18px}
-.side a{color:#cbd5e1;text-decoration:none;padding:10px 12px;border-radius:8px;display:block}
+.side a{color:#cbd5e1;text-decoration:none;padding:8px 12px;border-radius:8px;display:block}
 .side a:hover{background:#1e293b;color:#fff}
 .side a.on{background:var(--pri);color:#fff}
 .side a.fim{margin-top:auto;font-size:13px}
+.side .grp{margin:0}.side .grp summary{list-style:none;cursor:pointer;color:#cbd5e1;padding:8px 12px;border-radius:8px;display:flex;justify-content:space-between;align-items:center;user-select:none}
+.side .grp summary::-webkit-details-marker{display:none}
+.side .grp summary::after{content:"▸";font-size:12px;opacity:.7;transition:transform .15s}
+.side .grp[open] summary::after{transform:rotate(90deg)}
+.side .grp summary:hover{background:#1e293b;color:#fff}
+.side .grp[open] summary{color:#fff;font-weight:600}
+.side .grp a.sub{padding:6px 12px 6px 30px;font-size:14px;margin-left:6px;border-left:1px solid #334155;border-radius:0 8px 8px 0}
 .wrap{margin-left:224px}
 main{max-width:1180px;margin:24px auto;padding:0 20px}
 @media(max-width:900px){
+ .side .grp{width:100%}
  .side{position:static;width:auto;flex-direction:row;flex-wrap:wrap;align-items:center;padding:6px 8px;gap:0}
  .side .brand{padding:8px 10px}.side a.fim{margin:0 0 0 auto}.wrap{margin-left:0}main{padding:0 12px;margin:16px auto}}
 h1{font-size:22px;margin:0 0 4px} h2{font-size:16px;margin:0 0 10px}
@@ -3405,11 +5316,26 @@ main{margin:0;max-width:none;padding:0}.card{border:0;padding:0}}
 {% block head %}{% endblock %}
 </head><body>
 <aside class="side"><div class="brand">{{ empresa }}</div>
-{% for path, nome in [('/','🏠 Início'),('/clientes','👥 Clientes'),('/orcamentos','📋 Orçamentos'),('/produtos','📦 Produtos'),('/vendas','🛒 Vendas'),('/avaliacoes','⭐ Avaliações'),('/financeiro','💰 Financeiro'),('/bancos','🏦 Bancos'),('/agenda','📅 Agenda'),('/empresa','🏢 Empresa')] %}
-<a href="{{ path }}" class="{{ 'on' if (path == '/' and request.path == '/') or (path != '/' and request.path.startswith(path)) else '' }}">{{ nome }}</a>
+{% set grupos = [
+ ('🧾 Vendas', [('/clientes','👥 Clientes'),('/orcamentos','📋 Orçamentos'),('/orcamentos/followup','⏰ Orçamentos parados'),('/entregas','🚚 Entregas'),('/vendas','🛒 Vendas'),('/avaliacoes','⭐ Avaliações')]),
+ ('📦 Estoque', [('/produtos','📦 Produtos'),('/compras','🛍 Lista de compras')]),
+ ('💰 Dinheiro', [('/financeiro','💰 Financeiro'),('/contas','📆 Contas a pagar/receber'),('/bancos','🏦 Bancos'),('/relatorios','📈 Relatórios')]),
+ ('⚙️ Gestão', [('/agenda','📅 Agenda'),('/empresa','🏢 Empresa')]) ] %}
+{% macro ativo(path) %}{{ 'on' if (path == '/' and request.path == '/') or (path == '/orcamentos' and request.path.startswith('/orcamentos') and not request.path.startswith('/orcamentos/followup')) or (path != '/' and path != '/orcamentos' and request.path.startswith(path)) else '' }}{% endmacro %}
+<a href="/" class="{{ ativo('/') }}">🏠 Início</a>
+{% for titulo, itens in grupos %}{% set ns = namespace(on=false) %}{% for p, n in itens %}{% if request.path.startswith(p) %}{% set ns.on = true %}{% endif %}{% endfor %}
+<details class="grp" {{ 'open' if ns.on else '' }}><summary>{{ titulo }}</summary>
+{% for path, nome in itens %}<a href="{{ path }}" class="sub {{ ativo(path) }}">{{ nome }}</a>
+{% endfor %}</details>
 {% endfor %}
-<a class="fim" href="{{ url_for('backup') }}">⬇ Backup</a>
+<a href="/marketplaces" class="{{ ativo('/marketplaces') }}">🛍 Marketplaces</a>
+<a class="fim" href="{{ url_for('backup') }}">⬇ Backup</a><a href="{{ url_for('backups') }}" style="font-size:13px">🗄 Backups automáticos</a><a href="{{ url_for('seguranca') }}" style="font-size:13px">🔒 Segurança</a>{% if tem_senha %}<a href="{{ url_for('sair') }}" style="font-size:13px">↩ Sair</a>{% endif %}
 </aside>
+<script>
+document.querySelectorAll('.side .grp').forEach(d=>d.addEventListener('toggle',()=>{
+  if(d.open) document.querySelectorAll('.side .grp').forEach(o=>{ if(o!==d) o.open=false; });
+}));
+</script>
 <div class="wrap"><main>
 {% for cat, msg in get_flashed_messages(with_categories=true) %}<div class="flash {{ cat }}">{{ msg }}</div>{% endfor %}
 {% block conteudo %}{% endblock %}
@@ -3417,18 +5343,30 @@ main{margin:0;max-width:none;padding:0}.card{border:0;padding:0}}
 
 DASHBOARD = r"""{% extends "base.html" %}{% block conteudo %}
 <h1>Início</h1>
+{% if aviso_backup == 'sem_extra' %}<div class="flash erro" style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">🗄 Seus backups estão só neste computador. Se ele quebrar, você perde tudo. <a class="btn sm" href="{{ url_for('backups') }}">Configurar cópia extra</a><form method="post" action="{{ url_for('backup_dispensar_aviso') }}" style="margin:0"><button class="btn sec sm">Não mostrar mais</button></form></div>
+{% elif aviso_backup == 'falha' %}<div class="flash erro">🗄 A cópia extra do backup falhou ou a pasta não foi encontrada. <a href="{{ url_for('backups') }}">Ver detalhes</a></div>
+{% elif aviso_backup == 'antigo' %}<div class="flash erro">🗄 A última cópia extra do backup tem mais de 3 dias. <a href="{{ url_for('backups') }}">Ver detalhes</a></div>{% endif %}
 <div class="grid">
-  <div class="card kpi"><small>Orçamentos em aberto</small><b>{{ ab.n }}</b><small>{{ ab.t|brl }}</small></div>
+  <div class="card kpi"><small>Orçamentos aguardando aprovação</small><b>{{ ab.n }}</b><small>{{ ab.t|brl }}</small></div>
   <div class="card kpi"><small>Orçamentos aprovados no mês</small><b>{{ ap.t|brl }}</b><small>{{ ap.n }} orçamento(s)</small></div>
   <div class="card kpi"><small>Vendas no mês</small><b>{{ v.t|brl }}</b><small>{{ v.n }} venda(s)</small></div>
   <div class="card kpi"><small>Capital investido em estoque</small><b>{{ investido|brl }}</b><small><a href="{{ url_for('produtos') }}">ver estoque</a></small></div>
   <div class="card kpi"><small>Clientes</small><b>{{ n_clientes }}</b></div>
 </div>
+{% for cls, txt, lnk in avisos %}<div class="flash {{ cls }}">{{ txt }} <a href="{{ lnk }}">Ver</a></div>{% endfor %}
+{% if contas_ini %}<div class="card"><h2>Contas a vencer e vencidas</h2>
+<p class="nota">Até 7 dias. A pagar: <b>{{ contas_tot.despesa|brl }}</b> · A receber: <b>{{ contas_tot.receita|brl }}</b></p>
+<table><tr><th>Vencimento</th><th>Descrição</th><th class="n">Valor</th><th></th></tr>
+{% for c in contas_ini %}<tr><td style="white-space:nowrap">{{ c.venc|dt }}<br>{% if c.dias < 0 %}<span class="tag er">{{ -c.dias }} dia(s) atrasada</span>{% elif c.dias == 0 %}<span class="tag wa">hoje</span>{% else %}<span class="tag">em {{ c.dias }} dia(s)</span>{% endif %}</td>
+<td>{% if c.tipo == 'despesa' %}<span class="tag er">pagar</span>{% else %}<span class="tag ok">receber</span>{% endif %} {% if c.link %}<a href="{{ c.link }}">{{ c.descricao }}</a>{% else %}{{ c.descricao }}{% endif %}{% if c.categoria %}<br><span class="nota">{{ c.categoria }}</span>{% endif %}</td>
+<td class="n">{{ c.valor|brl }}</td>
+<td class="n">{% if c.origem == 'lancamento' %}<form class="inline" method="post" action="{{ url_for('conta_baixa', lid=c.id) }}"><input type="hidden" name="data" value="{{ hoje_iso }}"><input type="hidden" name="volta" value="inicio"><button class="btn sm">{{ 'Pagar' if c.tipo == 'despesa' else 'Receber' }}</button></form>{% else %}<a class="btn sec sm" href="{{ c.link }}">Registrar</a>{% endif %}</td></tr>{% endfor %}</table>
+<p style="margin-top:8px"><a href="{{ url_for('contas') }}">Ver todas as contas{% if contas_mais %} (+{{ contas_mais }}){% endif %}</a></p></div>{% endif %}
 {% if atrasados %}<div class="flash erro">Você tem {{ atrasados }} compromisso(s) da agenda com data vencida e ainda em aberto. <a href="{{ url_for('agenda') }}">Ver agenda</a></div>{% endif %}
-<div class="card"><h2>Orçamentos em aberto</h2>
+<div class="card"><h2>Orçamentos aguardando aprovação</h2>
 {% if abertos %}<table><tr><th>#</th><th>Cliente</th><th>Peça</th><th>Data</th><th class="n">Total</th></tr>
 {% for o in abertos %}<tr><td><a href="{{ url_for('orcamento_ver', oid=o.id) }}">{{ o.id }}</a></td><td>{{ o.cliente }}</td><td>{{ o.titulo or '' }}</td><td>{{ o.data|dt }}</td><td class="n">{{ o.total|brl }}</td></tr>{% endfor %}</table>
-{% else %}<p class="mut">Nenhum orçamento em aberto.</p>{% endif %}
+{% else %}<p class="mut">Nenhum orçamento aguardando aprovação.</p>{% endif %}
 <a class="btn sm" href="{{ url_for('orcamento_form') }}">+ Novo orçamento</a></div>
 <div class="row2">
   <div class="card"><h2>Próximos compromissos</h2>
@@ -3472,7 +5410,7 @@ dialog::backdrop{background:#0f172a66}dialog h2{margin-top:0}
 .btn.ghost{background:transparent;color:var(--pri);border:1px solid var(--bd)}
 td.ac{white-space:nowrap;text-align:right}
 </style>{% endblock %}{% block conteudo %}
-<div class="fin-top"><div><h1>Financeiro</h1><span class="mut" id="perLabel"></span></div>
+<div class="fin-top"><div><h1>Financeiro</h1><span class="mut" id="perLabel"></span> · <a href="{{ url_for('exportar') }}">Exportar para o contador</a></div>
 <div class="f"><div><label>Mês</label><select id="fMes"><option value="0">Ano todo</option>{% for m in meses %}<option value="{{ loop.index }}"{{ ' selected' if loop.index == mes_atual else '' }}>{{ m }}</option>{% endfor %}</select></div>
 <div><label>Ano</label><input type="number" id="fAno" value="{{ ano_atual }}" min="2000" max="2100" style="width:96px"></div></div></div>
 
@@ -3510,6 +5448,11 @@ td.ac{white-space:nowrap;text-align:right}
 <label>Observações</label><textarea id="lObs" rows="2"></textarea>
 <div id="lErro" class="flash erro" style="display:none;margin-top:10px"></div>
 <div class="bar" style="margin:14px 0 0;justify-content:flex-end"><button type="button" class="btn sec" id="lCancel">Cancelar</button><button type="button" class="btn" id="lSalvar">Salvar</button></div></form></dialog>
+
+<dialog id="dBaixa"><h2 id="bTit">Lançamento</h2><input type="hidden" id="bId">
+<p class="nota" id="bInfo"></p>
+<label id="bLblData">Data</label><input type="date" id="bData">
+<div class="bar" style="margin:14px 0 0;justify-content:flex-end;flex-wrap:wrap"><button type="button" class="btn sec" id="bFechar">Fechar</button><button type="button" class="btn sec" id="bEd">Editar</button><button type="button" class="btn red" id="bDesf">Desfazer baixa</button><button type="button" class="btn" id="bOk">Dar baixa</button></div></dialog>
 
 <dialog id="dCat"><h2>Categorias</h2><div id="catLista" style="max-height:40vh;overflow:auto"></div>
 <div class="row2" style="margin-top:10px"><div><label>Nova categoria</label><input id="cNome" maxlength="60"></div><div><label>Tipo</label><select id="cTipo"><option value="despesa">Despesa</option><option value="receita">Receita</option></select></div></div>
@@ -3614,15 +5557,41 @@ async function lista() {
   r.linhas.forEach(x => {
     const venda = x.origem === 'venda', ok = x.status === 'pago' || x.status === 'recebido';
     const tp = venda ? 'Venda' : (x.tipo === 'receita' ? 'Receita' : 'Despesa');
-    h += `<tr><td>${dbr(x.data)}</td><td>${venda ? `<a href="/vendas/${x.id}">${esc(x.descricao)}</a>` : esc(x.descricao)}</td><td>${esc(x.categoria)}</td><td>${tp}</td>
+    h += `<tr><td>${dbr(x.data)}</td><td>${venda ? `<a href="/vendas/${x.id}">${esc(x.descricao)}</a>` : `<a href="#" data-b="${x.id}">${esc(x.descricao)}</a>`}</td><td>${esc(x.categoria)}</td><td>${tp}</td>
       <td class="n ${x.tipo === 'despesa' ? 'neg' : 'pos'}">${x.tipo === 'despesa' ? '− ' : ''}${brl(x.valor)}</td>
       <td><span class="tag ${ok ? 'ok' : 'wa'}">${SIT[x.status] || x.status}</span></td>
-      <td class="ac">${venda ? '<span class="nota">automática</span>' : `<button class="btn sec sm" data-e="${x.id}">Editar</button> <button class="btn red sm" data-x="${x.id}">Excluir</button>`}</td></tr>`; });
+      <td class="ac">${venda ? '<span class="nota">automática</span>' : `${ok ? '' : `<button class="btn sm" data-p="${x.id}">${x.tipo === 'despesa' ? 'Pagar' : 'Receber'}</button> `}<button class="btn sec sm" data-e="${x.id}">Editar</button> <button class="btn red sm" data-x="${x.id}">Excluir</button>`}</td></tr>`; });
   $('lista').innerHTML = h + '</table>';
   window.LINHAS = r.linhas;
 }
+function baixaAbrir(x) {
+  if (!x) return;
+  const ok = x.status === 'pago' || x.status === 'recebido', d = x.tipo === 'despesa';
+  $('bId').value = x.id;
+  $('bTit').textContent = x.descricao;
+  $('bInfo').innerHTML = (d ? 'Despesa' : 'Receita') + ' · ' + esc(x.categoria || '') + ' · <b>' + brl(x.valor) + '</b><br>Vencimento: ' + (dbr(x.vencimento) || '—') + ' · ' + (SIT[x.status] || x.status) + (ok && x.pagamento ? ' em ' + dbr(x.pagamento) : '');
+  $('bData').value = ok && x.pagamento ? x.pagamento : new Date().toLocaleDateString('sv');
+  $('bData').disabled = ok;
+  $('bLblData').textContent = d ? 'Data do pagamento' : 'Data do recebimento';
+  $('bOk').style.display = ok ? 'none' : ''; $('bOk').textContent = d ? 'Dar baixa (pago)' : 'Dar baixa (recebido)';
+  $('bDesf').style.display = ok ? '' : 'none';
+  $('bEd').onclick = () => { $('dBaixa').close(); abrir(x); };
+  $('dBaixa').showModal();
+}
+async function baixaEnviar(corpo) {
+  const r = await fetch('/api/financeiro/lancamentos/' + $('bId').value + '/baixa', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(corpo)});
+  const j = await r.json();
+  if (!j.ok) { alert((j.erros || ['Erro']).join('\n')); return; }
+  $('dBaixa').close(); atualizar();
+}
+$('bOk').onclick = () => baixaEnviar({data: $('bData').value});
+$('bDesf').onclick = () => baixaEnviar({desfazer: true});
+$('bFechar').onclick = () => $('dBaixa').close();
 $('lista').addEventListener('click', async e => {
+  const a = e.target.closest('a[data-b]');
+  if (a) { e.preventDefault(); baixaAbrir(window.LINHAS.find(x => x.origem === 'lancamento' && x.id == a.dataset.b)); return; }
   const b = e.target.closest('button'); if (!b) return;
+  if (b.dataset.p) { baixaAbrir(window.LINHAS.find(x => x.origem === 'lancamento' && x.id == b.dataset.p)); }
   if (b.dataset.e) { abrir(window.LINHAS.find(x => x.origem === 'lancamento' && x.id == b.dataset.e)); }
   if (b.dataset.x && confirm('Excluir este lançamento?')) { await fetch('/api/financeiro/lancamentos/' + b.dataset.x, {method: 'DELETE'}); atualizar(); }
 });
@@ -3702,7 +5671,7 @@ CLIENTE_VER = r"""{% extends "base.html" %}{% block conteudo %}
 <div class="cab"><h1>{{ c.nome }}</h1>
 <div class="bar"><a class="btn" href="{{ url_for('orcamento_form', cliente_id=c.id) }}">+ Novo orçamento</a>
 <a class="btn sec" href="{{ url_for('cliente_form', cid=c.id) }}">Editar dados</a></div></div>
-<div class="card"><p>{% if c.telefone %}📞 {{ c.telefone }} &nbsp; {% endif %}{% if c.email %}✉ {{ c.email }}{% endif %}{% if c.cidade or c.endereco %}<br>📍 {{ c.endereco or '' }}{% if c.endereco and c.cidade %} — {% endif %}{{ c.cidade or '' }}{% endif %}</p>
+<div class="card"><p>{% if c.documento %}🪪 {{ c.documento }} &nbsp; {% endif %}{% if c.telefone %}📞 {{ c.telefone }} &nbsp; {% endif %}{% if c.email %}✉ {{ c.email }}{% endif %}{% if c.cidade or c.endereco %}<br>📍 {{ c.endereco or '' }}{% if c.endereco and c.cidade %} — {% endif %}{{ c.cidade or '' }}{% endif %}</p>
 {% if c.obs %}<p class="mut">{{ c.obs }}</p>{% endif %}
 <p><b>Total em orçamentos aprovados/concluídos:</b> {{ fechado|brl }}</p></div>
 
@@ -3733,6 +5702,14 @@ CLIENTE_FORM = r"""{% extends "base.html" %}{% block conteudo %}
 <label>Nome *</label><input name="nome" value="{{ c.nome if c else '' }}" required autofocus>
 <div class="row2"><div><label>Telefone</label><input name="telefone" value="{{ c.telefone if c else '' }}"></div>
 <div><label>E-mail</label><input name="email" type="email" value="{{ c.email if c else '' }}"></div></div>
+<div class="row2"><div><label>CPF / CNPJ <span class="mut">(opcional — só se for emitir nota fiscal)</span></label><input name="documento" id="cDoc" inputmode="numeric" maxlength="18" placeholder="000.000.000-00" value="{{ (c.documento or '') if c else '' }}"></div><div></div></div>
+<script>
+const cdoc = document.getElementById('cDoc');
+cdoc.addEventListener('input', () => { const d = cdoc.value.replace(/\D/g, '').slice(0, 14); let s = d;
+  if (d.length <= 11) s = d.replace(/(\d{3})(\d)/, '$1.$2').replace(/(\d{3})(\d)/, '$1.$2').replace(/(\d{3})(\d{1,2})$/, '$1-$2');
+  else s = d.replace(/^(\d{2})(\d)/, '$1.$2').replace(/^(\d{2})\.(\d{3})(\d)/, '$1.$2.$3').replace(/\.(\d{3})(\d)/, '.$1/$2').replace(/(\d{4})(\d)/, '$1-$2');
+  cdoc.value = s; });
+</script>
 <div class="row2"><div><label>Cidade</label><input name="cidade" value="{{ c.cidade or '' if c else '' }}"></div>
 <div><label>Endereço</label><input name="endereco" value="{{ c.endereco or '' if c else '' }}"></div></div>
 <label>Observações</label><textarea name="obs" rows="3">{{ c.obs if c else '' }}</textarea>
@@ -3749,9 +5726,10 @@ PRODUTOS = r"""{% extends "base.html" %}{% block conteudo %}
   <div class="card kpi"><small>Lucro potencial</small><b class="cst" data-k="lucro">••••••</b></div>
 </div>
 <div id="semCusto" class="flash erro" style="display:none"></div>
-<div class="bar"><form><input name="q" value="{{ q }}" placeholder="Buscar por nome ou código"><button class="btn sec">Buscar</button></form>
+<div class="bar"><form><input name="q" value="{{ q }}" placeholder="Buscar por nome ou código"><input type="hidden" name="o" value="{{ ordem }}">{% if desc %}<input type="hidden" name="d" value="desc">{% endif %}{% if por != 50 %}<input type="hidden" name="n" value="{{ por }}">{% endif %}<button class="btn sec">Buscar</button></form>
 <a class="btn" href="{{ url_for('produto_form') }}">+ Novo produto</a></div>
-<div class="card">{% if rows %}<table><tr><th>Produto</th><th>Categoria</th><th>Código</th><th class="n">Custo</th><th class="n">Preço de venda</th><th class="n">Mínimo</th><th class="n">Estoque</th><th class="n">Investido</th><th></th></tr>
+<div class="card">{% if rows %}{% macro th(chave, rotulo, cls='') %}<th{{ ' class="' ~ cls ~ '"' if cls else '' }}><a href="{{ url_for('produtos', q=q or None, o=chave, d=('desc' if (ordem == chave and not desc) else None), n=(por if por != 50 else None)) }}" title="Ordenar por {{ rotulo|lower }}" style="color:inherit;text-decoration:none;white-space:nowrap">{{ rotulo }}{% if ordem == chave %} {{ '▼' if desc else '▲' }}{% endif %}</a></th>{% endmacro %}
+<table><tr>{{ th('nome','Produto') }}{{ th('categoria','Categoria') }}{{ th('codigo','Código') }}<th class="n">Custo</th>{{ th('preco','Preço de venda','n') }}{{ th('minimo','Mínimo','n') }}{{ th('estoque','Estoque','n') }}<th class="n">Investido</th><th></th></tr>
 {% for p in rows %}<tr><td>{{ p.nome }}{% if p.servico %} <span class="tag">serviço</span>{% endif %}</td><td>{{ p.categoria or '' }}</td><td>{{ p.sku or '' }}</td>
 <td class="n cst" data-id="{{ p.id }}" data-k="custo">••••••</td>
 <td class="n">{{ p.preco|brl }}{% if p.unidade != 'un' %} <span class="mut">/ {{ p.unidade|ul }}</span>{% endif %}</td>
@@ -3759,8 +5737,16 @@ PRODUTOS = r"""{% extends "base.html" %}{% block conteudo %}
 <td class="n">{% if not p.servico %}<span class="tag {{ 'er' if p.estoque <= 0 else ('wa' if p.estoque <= p.estoque_min else 'ok') }}">{{ p.estoque|num(4) }} {{ p.unidade|ul }}</span>{% else %}<span class="mut">—</span>{% endif %}</td>
 <td class="n">{% if not p.servico %}<span class="cst" data-id="{{ p.id }}" data-k="investido">••••••</span>{% else %}<span class="mut">—</span>{% endif %}</td>
 <td class="n" style="white-space:nowrap"><a class="btn sec sm" href="{{ url_for('produto_form', pid=p.id) }}">Editar</a>
+<a class="btn sec sm" href="{{ url_for('produto_duplicar', pid=p.id) }}" title="Criar um novo produto com os mesmos dados">Duplicar</a>
 {% if not p.servico %}<a class="btn sec sm" href="{{ url_for('produto_movimentos', pid=p.id) }}">Histórico</a>{% endif %}
 <form class="inline" method="post" action="{{ url_for('produto_excluir', pid=p.id) }}" onsubmit="return confirm('Excluir este produto?')"><button class="btn red sm">Excluir</button></form></td></tr>{% endfor %}</table>
+<div class="bar noprint" style="margin:12px 0 0;justify-content:space-between;align-items:center">
+<span class="mut">Mostrando {{ de }}–{{ ate }} de {{ total }} produto(s)</span>
+<div class="bar" style="margin:0;align-items:center">
+{% if pg > 1 %}<a class="btn sec sm" href="{{ url_for('produtos', q=q or None, o=ordem, d=('desc' if desc else None), n=(por if por != 50 else None), pg=(pg - 1 if pg > 2 else None)) }}">← Anterior</a>{% endif %}
+<span class="mut">Página {{ pg }} de {{ paginas }}</span>
+{% if pg < paginas %}<a class="btn sec sm" href="{{ url_for('produtos', q=q or None, o=ordem, d=('desc' if desc else None), n=(por if por != 50 else None), pg=pg + 1) }}">Próxima →</a>{% endif %}
+<span class="mut" style="margin-left:8px">Por página:</span>{% for k in (50, 100, 200) %}<a class="btn {{ '' if k == por else 'sec' }} sm" href="{{ url_for('produtos', q=q or None, o=ordem, d=('desc' if desc else None), n=(k if k != 50 else None)) }}">{{ k }}</a>{% endfor %}</div></div>
 {% else %}<p class="mut">Nenhum produto cadastrado.</p>{% endif %}</div>
 <script>
 (function(){
@@ -3796,13 +5782,14 @@ pinta();
 {% endblock %}"""
 
 PRODUTO_FORM = r"""{% extends "base.html" %}{% block conteudo %}
-<h1>{{ 'Editar produto' if pid else 'Novo produto' }}</h1>
-<form class="card" method="post">
+<h1>{{ 'Editar produto' if pid else ('Duplicar produto' if dup else 'Novo produto') }}</h1>
+{% if dup %}<p class="mut" style="margin:-6px 0 10px">Os dados do produto original foram copiados. O código vem com o próximo da sequência e o estoque começa em zero. Nada é salvo até você clicar em Salvar.</p>{% endif %}
+<form class="card" method="post"{% if dup %} action="{{ url_for('produto_form') }}"{% endif %}>
 <div class="row2"><div><label>Nome *</label><input name="nome" value="{{ p.nome if p else '' }}" required autofocus></div>
-<div><label>Código / SKU</label><input name="sku" value="{{ p.sku if p else (sku_sug or '') }}">{% if not pid %}<small class="mut">Sugestão automática (contador). Troque por um código seu, se quiser; em branco, o sistema usa o próximo número.</small>{% endif %}</div></div>
+<div><label>Código / SKU</label><input name="sku" value="{{ sku_sug if dup else ((p.sku or '') if p else (sku_sug or '')) }}">{% if not pid %}<small class="mut">Sugestão automática (contador). Troque por um código seu, se quiser; em branco, o sistema usa o próximo número.</small>{% endif %}</div></div>
 <div class="row2"><div><label>Categoria (como aparece nos acompanhamentos do orçamento)</label>
 {% set sel = (p.categoria_id|string) if p and p.categoria_id else '' %}
-<div style="display:flex;gap:6px"><select name="categoria_id" id="catSel"><option value="">— selecionar categoria —</option>{% for c in cats %}{% if c.ativo or c.id|string == sel %}<option value="{{ c.id }}"{{ ' selected' if c.id|string == sel else '' }}>{{ c.nome }}{{ '' if c.ativo else ' (inativa)' }}</option>{% endif %}{% endfor %}</select>
+<div style="display:flex;gap:6px"><select name="categoria_id" id="catSel"><option value="">— selecionar categoria —</option>{% for c in cats %}{% if c.ativo or c.id|string == sel %}<option value="{{ c.id }}" data-un="{{ c.unidade or 'un' }}"{{ ' selected' if c.id|string == sel else '' }}>{{ c.nome }}{{ '' if c.ativo else ' (inativa)' }}</option>{% endif %}{% endfor %}</select>
 <button type="button" class="btn sec sm" id="catNova" style="white-space:nowrap">+ Nova categoria</button></div>
 <div id="catBox" style="display:none;margin-top:6px;gap:6px"><input id="catNome" placeholder="Nome da nova categoria" maxlength="60" style="flex:1"><button type="button" class="btn sm" id="catSalvar">Cadastrar</button></div>
 <div class="hint" id="catMsg"></div></div>
@@ -3828,7 +5815,7 @@ document.getElementById('catNome').addEventListener('keydown', e => { if (e.key 
 document.getElementById('catSalvar').onclick = async () => {
   const msg = document.getElementById('catMsg'), r = await fetch('/api/categorias-produto', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({nome: document.getElementById('catNome').value})}), j = await r.json();
   if (!j.ok) { msg.textContent = j.erro; msg.style.color = '#b91c1c'; return; }
-  const o = new Option(j.nome, j.id, true, true), s = document.getElementById('catSel'); s.add(o); s.value = j.id;
+  const o = new Option(j.nome, j.id, true, true), s = document.getElementById('catSel'); o.dataset.un = j.unidade || 'un'; s.add(o); s.value = j.id;
   document.getElementById('catNome').value = ''; document.getElementById('catBox').style.display = 'none'; msg.style.color = ''; msg.textContent = 'Categoria cadastrada e selecionada.';
 };
 const un=document.getElementById('un'), serv=document.getElementById('serv');
@@ -3848,6 +5835,10 @@ function mg(){
   el.textContent='R$ '+(pr-c).toFixed(2).replace('.',',')+' por '+({un:'unidade',m2:'m²',ml:'metro'}[un.value])+' ('+Math.round((pr-c)/c*100)+'% sobre o custo)';
 }
 un.addEventListener('change',tog); serv.addEventListener('change',tog); tog();
+document.getElementById('catSel').addEventListener('change', function () {      // unidade padrão da categoria
+  const o = this.options[this.selectedIndex], u = o && o.dataset.un;
+  if (u && ['un', 'm2', 'ml'].includes(u)) { un.value = u; tog(); }
+});
 document.getElementById('btnCusto').addEventListener('click',function(){
   const b=document.getElementById('custoBox'), v=b.style.display==='none';
   b.style.display=v?'':'none'; this.textContent=v?'Ocultar custos':'Mostrar custos';
@@ -3971,7 +5962,8 @@ tr.det table{font-size:13px;margin:2px 0}
   <div class="hint" style="margin:0">Ative o que este produto leva. A largura e a altura acima valem para todos os componentes. O preço vale só para este orçamento: o cadastro não é alterado.</div>
   {% if not cat %}<div class="flash erro" style="margin-top:8px">Nenhum produto cadastrado. Cadastre os materiais em <a href="{{ url_for('produto_form') }}" target="_blank">Produtos</a> (informe a categoria: Moldura, Vidro, Fundo...) e recarregue esta página. Você também pode usar “+ Componente avulso”.</div>{% endif %}
   <div class="ct"><div class="h"><span></span><span>Componente</span><span>Material / Variação</span><span>Quantidade</span><span>Preço</span><span style="text-align:right">Subtotal</span></div><div id="comps"></div></div>
-  <div id="avBox" style="display:none"><div class="av-h">Componentes avulsos</div><div class="ct av"><div id="avulsos"></div></div></div>
+  <div id="avBox" style="display:none"><div class="av-h">Componentes avulsos</div><div class="ct av"><div id="avulsos"></div></div>
+<p class="nota" style="margin:6px 0 0"><b>Como cobrar:</b> <b>por unidade</b> = preço × quantidade (ex.: mão de obra, fixação); <b>por m²</b> = preço × largura × altura da peça (com o arredondamento de 5 cm); <b>por ML</b> = preço × perímetro da peça + perda de moldura. A quantidade calculada pode ser trocada à mão.</p></div>
   <div style="margin-top:10px"><button type="button" class="btn sec sm" id="btnAvulso">+ Componente avulso</button></div>
   <div id="dls"></div>
  </div>
@@ -4020,7 +6012,7 @@ const abertos=new Set();
 
 function novoComp(o){return Object.assign({key:'',categoria:'',ativo:false,custom:false,produto_id:null,nome:'',unidade:'',qtd:'',manual:false,preco:'',espessura:'',minimo:''},o||{});}
 function novoCfg(){return {comps:CAT.map(g=>novoComp({key:'c:'+g.nome,categoria:g.nome}))};}
-function novoCustom(){return novoComp({key:'x:'+(++nCustom),ativo:true,custom:true});}
+function novoCustom(){return novoComp({key:'x:'+(++nCustom),ativo:true,custom:true,unidade:'un',qtd:'1'});}
 function cfgDe(inp){
   const c=novoCfg();
   (inp.componentes||[]).forEach(s=>{
@@ -4057,15 +6049,17 @@ function preencheCliente(){
 }
 
 /* ---------- tabela de acompanhamentos ---------- */
-function listas(){
-  $('dls').innerHTML=CAT.map((g,i)=>'<datalist id="dl_'+i+'">'+g.produtos.map(p=>'<option value="'+esc(p.rot)+'">'+esc(brl(p.preco)+(p.un!=='un'?' / '+UL[p.un]:'')+(p.controla?' · estoque '+fq(p.estoque):''))+'</option>').join('')+'</datalist>').join('');
-}
+function listaHTML(i){const g=CAT[i];return '<datalist id="dl_'+i+'">'+g.produtos.map(p=>'<option value="'+esc(p.rot)+'">'+esc(brl(p.preco)+(p.un!=='un'?' / '+UL[p.un]:'')+(p.controla?' · estoque '+fq(p.estoque):''))+'</option>').join('')+'</datalist>';}
+/* a lista de materiais de cada categoria só é montada quando você clica no campo (leve mesmo com milhares de produtos) */
+function listas(){ $('dls').innerHTML=''; }
+document.addEventListener('focusin',e=>{const l=e.target.getAttribute&&e.target.getAttribute('list');
+  if(l&&/^dl_\d+$/.test(l)&&!document.getElementById(l)&&CAT[+l.slice(3)]) $('dls').insertAdjacentHTML('beforeend',listaHTML(+l.slice(3)));});
 function linhaHTML(r){
   const idx=CAT.findIndex(g=>g.nome===r.categoria);
   let mat;
   if(!r.custom) mat='<input class="mat" list="dl_'+idx+'" placeholder="Selecione o material..." autocomplete="off">';
   else if(r.produto_id) mat='<div class="fixo mat-fixo"></div>';
-  else mat='<div class="comb"><input class="cnome" placeholder="Descrição (ex.: Mão de obra)" maxlength="120"><select class="cun" style="max-width:104px"><option value="">Unidade</option><option value="un">unidade</option><option value="m2">m²</option><option value="ml">ML</option></select></div>';
+  else mat='<div class="comb"><input class="cnome" placeholder="Descrição (ex.: Mão de obra)" maxlength="120"><select class="cun" style="max-width:150px"><option value="">Escolha como cobrar…</option><option value="un">Por unidade (× quantidade)</option><option value="m2">Por m² (largura × altura)</option><option value="ml">Por ML (perímetro + perda)</option></select></div>';
   return '<div class="c-sw"><input type="checkbox" class="tg ck" aria-label="Ativar"></div>'+
    '<div class="c-nm"><b class="nm"></b><div class="sm mut inf"></div></div>'+
    '<div class="c-mat">'+mat+'<div class="f-i sm mut"></div></div>'+
@@ -4203,6 +6197,12 @@ function editar(i){
   $('cfgTitulo').textContent='Editando item '+(i+1); $('btnAdd').textContent='✓ Salvar alterações do item'; $('btnCancEdit').style.display='';
   renderTabela(); calcular(); $('cfgTitulo').scrollIntoView({behavior:'smooth',block:'start'});
 }
+function duplicar(i){
+  const it=linhas[i]; if(!it) return;
+  linhas.splice(i+1,0,JSON.parse(JSON.stringify(it)));
+  abertos.clear(); if(editIdx>i) editIdx++;
+  sujo(); editar(i+1);
+}
 async function mudaQtd(i,val){
   const n=Number(val), it=linhas[i];
   if(!Number.isInteger(n)||n<1){renderTabela(); return;}
@@ -4222,7 +6222,7 @@ function renderTabela(){
     linhas.map((it,i)=>{
       const v=it.view, ab=abertos.has(i);
       const comp=v.componentes.map(c=>esc(c.descricao||c.categoria)).join(' + ');
-      let r='<tr class="'+(i===editIdx?'editando':'')+'"><td>'+(i+1)+'</td><td><a href="#" class="arrow" data-det="'+i+'" title="Ver composição">'+(ab?'▾':'▸')+'</a><b>'+esc(v.nome)+'</b>'+(v.descricao?'<div class="sm mut" style="margin-left:16px">'+esc(v.descricao)+'</div>':'')+'</td><td>'+esc(v.medidas||'—')+'</td><td>'+comp+'</td><td class="n"><input type="number" class="qi" min="1" step="1" value="'+v.qtd+'" data-q="'+i+'" aria-label="Quantidade"></td><td class="n">'+esc(v.valor_unit_txt)+'</td><td class="n"><b>'+esc(v.total_txt)+'</b></td><td class="n" style="white-space:nowrap"><button type="button" class="btn sec sm" data-ed="'+i+'">Editar</button> <button type="button" class="btn red sm" data-del="'+i+'">Excluir</button></td></tr>';
+      let r='<tr class="'+(i===editIdx?'editando':'')+'"><td>'+(i+1)+'</td><td><a href="#" class="arrow" data-det="'+i+'" title="Ver composição">'+(ab?'▾':'▸')+'</a><b>'+esc(v.nome)+'</b>'+(v.descricao?'<div class="sm mut" style="margin-left:16px">'+esc(v.descricao)+'</div>':'')+'</td><td>'+esc(v.medidas||'—')+'</td><td>'+comp+'</td><td class="n"><input type="number" class="qi" min="1" step="1" value="'+v.qtd+'" data-q="'+i+'" aria-label="Quantidade"></td><td class="n">'+esc(v.valor_unit_txt)+'</td><td class="n"><b>'+esc(v.total_txt)+'</b></td><td class="n" style="white-space:nowrap"><button type="button" class="btn sec sm" data-ed="'+i+'">Editar</button> <button type="button" class="btn sec sm" data-dup="'+i+'" title="Duplicar este item e abrir na edição">Duplicar</button> <button type="button" class="btn red sm" data-del="'+i+'">Excluir</button></td></tr>';
       if(ab) r+='<tr class="det"><td></td><td colspan="7"><table><tr><th>Componente</th><th>Material</th><th class="n">Qtd. por peça</th><th class="n">Preço aplicado</th><th class="n">Subtotal por peça</th></tr>'+v.componentes.map(c=>'<tr><td>'+esc(c.categoria||'Avulso')+'</td><td>'+esc(c.descricao)+'</td><td class="n">'+esc(c.qtd_unit_txt)+' '+esc(c.rotulo_un)+'</td><td class="n">'+esc(c.preco_unit_txt)+(c.unidade!=='un'?' / '+esc(c.rotulo_un):'')+'</td><td class="n">'+esc(c.sub_unit_txt)+'</td></tr>').join('')+'</table></td></tr>';
       return r;
     }).join('')+'</tbody></table>';
@@ -4284,6 +6284,7 @@ $('btnLimpar').addEventListener('click',()=>{if(!linhas.length) return; if(confi
 $('tabela').addEventListener('click',e=>{
   const t=e.target;
   if(t.matches('[data-ed]')) editar(parseInt(t.dataset.ed,10));
+  else if(t.matches('[data-dup]')) duplicar(parseInt(t.dataset.dup,10));
   else if(t.matches('[data-del]')){const i=parseInt(t.dataset.del,10); if(confirm('Excluir este item do orçamento?')){linhas.splice(i,1); abertos.clear(); if(editIdx===i){resetCfg();} else if(editIdx>i){editIdx--;} sujo(); renderTabela();}}
   else if(t.matches('[data-det]')){e.preventDefault(); const i=parseInt(t.dataset.det,10); if(abertos.has(i)) abertos.delete(i); else abertos.add(i); renderTabela();}
 });
@@ -4310,6 +6311,7 @@ ORCAMENTO_VER = r"""{% extends "base.html" %}{% block head %}<style>
 {% if o.status in ('aprovado', 'producao', 'concluido') %}<a class="btn sec" target="_blank" href="{{ url_for('orcamento_imprimir', oid=o.id, modo='os', auto=1) }}">🖨 Imprimir ordem de serviço</a>{% endif %}
 <a class="btn sec" href="{{ url_for('orcamento_form', oid=o.id) }}">Editar</a>
 <form class="inline" method="post" action="{{ url_for('orcamento_duplicar', oid=o.id) }}"><button class="btn sec">Duplicar</button></form>
+{% if o.status in ('aprovado', 'producao', 'concluido') %}<form class="inline" method="post" action="{{ url_for('pronto_enviar', oid=o.id) }}" target="_blank"><button class="btn" style="background:#16a34a">💬 {{ 'Avisar de novo: pronto' if o.pronto_enviado_em else 'Avisar que está pronto' }}</button></form>{% endif %}
 {% if o.status == 'concluido' %}<form class="inline" method="post" action="{{ url_for('avaliacao_enviar', oid=o.id) }}" target="_blank"><button class="btn" style="background:#16a34a">💬 {{ 'Reenviar pedido de avaliação' if o.aval_enviada_em else 'Pedir avaliação no WhatsApp' }}</button></form>{% if o.aval_enviada_em %}<span class="tag ok">avaliação pedida em {{ o.aval_enviada_em|dt }}</span>{% endif %}{% endif %}</div></div>
 
 <div class="card">
@@ -4336,15 +6338,31 @@ ORCAMENTO_VER = r"""{% extends "base.html" %}{% block head %}<style>
 {% for c in comps[l.id] %}<tr><td>{{ c.categoria or c.descricao }}{% if c.categoria and c.descricao != c.categoria %}<div class="mut">{{ c.descricao }}</div>{% endif %}</td>
 <td class="n">{{ c.qtd_unit|qtd(c.unidade) }} {{ c.unidade|ul }}</td><td class="n">{{ c.preco_unit|brl }}{% if c.unidade != 'un' %} / {{ c.unidade|ul }}{% endif %}</td><td class="n">{{ c.sub_unit|brl }}</td></tr>{% endfor %}</table></details></td>
 <td class="mut">{% if l.largura and l.altura %}{{ l.largura|num }} × {{ l.altura|num }} cm{% endif %}</td>
-<td class="n">{{ l.qtd }}</td><td class="n">{{ l.valor_unit|brl }}</td><td class="n">{{ l.total|brl }}</td></tr>{% endfor %}</table>
+<td class="n">{{ l.qtd }}</td><td class="n">{{ l.valor_unit|brl }}</td><td class="n">{% if desc_l[l.id] %}<span class="mut" style="text-decoration:line-through">{{ l.total|brl }}</span><br><span style="color:#dc2626;font-size:12px">desconto − {{ desc_l[l.id]|brl }}</span><br><b>{{ (l.total - desc_l[l.id])|brl }}</b>{% else %}{{ l.total|brl }}{% endif %}</td></tr>{% endfor %}</table>
 <div class="total">{% if o.desconto %}<span class="mut" style="font-size:15px">Subtotal {{ subtotal|brl }} · Desconto{% if o.desconto_tipo == 'pct' %} ({{ o.desconto_valor|num(2) }}%){% endif %} − {{ o.desconto|brl }}</span><br>{% endif %}Total: <b>{{ o.total|brl }}</b></div>
 {% if o.obs %}<p><b>Observações:</b> {{ o.obs }}</p>{% endif %}
 {% if emp.obs_inst or emp.rodape %}<div class="rodape">{% if emp.obs_inst %}<div>{{ emp.obs_inst }}</div>{% endif %}{% if emp.rodape %}<div>{{ emp.rodape }}</div>{% endif %}</div>{% endif %}
 </div>
 
+{% if o.status in ('aprovado', 'producao', 'concluido') or pag.itens %}
+<div class="card noprint" id="pagamentos"><h2>Pagamentos do serviço <span class="tag {{ 'ok' if pag.saldo == 0 and pag.itens else ('wa' if pag.pago else '') }}">{% if pag.saldo == 0 and pag.itens %}quitado{% elif pag.pago %}saldo {{ pag.saldo|brl }}{% else %}nada recebido{% endif %}</span></h2>
+<p class="mut">Registre o <b>sinal</b> na aprovação e os demais pagamentos até a entrega. A receita continua sendo contada na conclusão; aqui controlamos o dinheiro que já entrou.</p>
+{% if pag.itens %}<table><tr><th>Data</th><th>Forma</th><th>Obs.</th><th class="n">Valor</th><th></th></tr>
+{% for p in pag.itens %}<tr><td>{{ p.data|dia }}</td><td>{{ p.forma }}</td><td>{{ p.obs or '' }}</td><td class="n">{{ p.valor|brl }}</td>
+<td class="n"><form class="inline" method="post" action="{{ url_for('pagamento_excluir', oid=o.id, pid=p.id) }}" onsubmit="return confirm('Excluir este pagamento?')"><button class="btn red sm">Excluir</button></form></td></tr>{% endfor %}</table>{% endif %}
+<p style="margin:10px 0">Total do serviço <b>{{ o.total|brl }}</b> · Recebido <b>{{ pag.pago|brl }}</b> · <b>Saldo a receber {{ pag.saldo|brl }}</b></p>
+{% if pag.saldo > 0 and o.status in ('aprovado', 'producao', 'concluido') %}
+<form method="post" action="{{ url_for('pagamento_novo', oid=o.id) }}" class="bar" style="align-items:end;flex-wrap:wrap">
+<div><label>Valor (R$)</label><input name="valor" id="pgValor" inputmode="decimal" placeholder="0,00" style="width:130px" required></div>
+<div><label>Data</label><input type="date" name="data" value="{{ hoje }}" style="width:160px" required></div>
+<div><label>Forma</label><select name="forma" style="width:150px">{% for f in formas %}<option>{{ f }}</option>{% endfor %}</select></div>
+<div style="flex:1;min-width:160px"><label>Obs.</label><input name="obs" maxlength="120" placeholder="{{ 'ex.: sinal' if not pag.itens else '' }}"></div>
+<button class="btn sm">Registrar pagamento</button>
+<button class="btn sec sm" type="button" onclick="document.getElementById('pgValor').value='{{ ('%.2f'|format(pag.saldo / 100)).replace('.', ',') }}'">Preencher saldo</button></form>{% endif %}</div>
+{% endif %}
 <div class="card noprint"><h2>Situação do orçamento</h2>
-<p class="mut">Ao <b>aprovar</b>, os produtos usados são descontados do estoque. Se o orçamento for <b>cancelado</b>, voltar para <b>em aberto</b>, editado ou excluído, o estoque é ajustado automaticamente.</p><div class="bar">
-{% for k, v in ORC.items() %}{% if k != o.status %}<form class="inline" method="post" action="{{ url_for('orcamento_status', oid=o.id) }}"><input type="hidden" name="status" value="{{ k }}"><button class="btn {{ 'red' if k == 'recusado' else ('sec' if k == 'aberto' else '') }} sm">Marcar como: {{ v[0] }}</button></form>{% endif %}{% endfor %}
+<p class="mut">Ao <b>aprovar</b>, os produtos usados são descontados do estoque. Se o orçamento for <b>cancelado</b>, voltar para <b>orçamento</b> ou <b>em aberto</b>, editado ou excluído, o estoque é ajustado automaticamente.</p><div class="bar">
+{% for k, v in ORC.items() %}{% if k != o.status %}<form class="inline" method="post" action="{{ url_for('orcamento_status', oid=o.id) }}"><input type="hidden" name="status" value="{{ k }}"><button class="btn {{ 'red' if k == 'recusado' else ('sec' if k in ('orcamento', 'aberto') else '') }} sm">Marcar como: {{ v[0] }}</button></form>{% endif %}{% endfor %}
 <form class="inline" method="post" action="{{ url_for('orcamento_excluir', oid=o.id) }}" onsubmit="return confirm('Excluir este orçamento definitivamente?')"><button class="btn red sm">Excluir orçamento</button></form>
 </div></div>
 {% endblock %}"""
@@ -4403,14 +6421,15 @@ document.getElementById('logo').addEventListener('change', e => { const f = e.ta
 
 CATEGORIAS = r"""{% extends "base.html" %}{% block conteudo %}
 <div class="cab"><h1>Categorias de produtos</h1><div class="bar"><a class="btn sec" href="{{ url_for('duplicidades') }}">Duplicidades de SKU/telefone</a><a class="btn sec" href="{{ url_for('produtos') }}">Voltar aos produtos</a></div></div>
-<div class="card"><form method="post" action="{{ url_for('categoria_nova') }}" class="bar" style="align-items:end"><div style="flex:1;min-width:220px"><label>Nova categoria</label><input name="nome" maxlength="60" placeholder="Ex.: Ferragens"></div><button class="btn">Cadastrar</button></form></div>
-<div class="card"><table><tr><th>Nome</th><th>Produtos</th><th>Situação</th><th></th></tr>
+<div class="card"><form method="post" action="{{ url_for('categoria_nova') }}" class="bar" style="align-items:end"><div style="flex:1;min-width:220px"><label>Nova categoria</label><input name="nome" maxlength="60" placeholder="Ex.: Ferragens"></div><div><label>Unidade padrão</label><select name="unidade"><option value="un" {{ 'selected' if "un" == 'un' else '' }}>Unitário (un)</option><option value="m2" {{ 'selected' if "un" == 'm2' else '' }}>m²</option><option value="ml" {{ 'selected' if "un" == 'ml' else '' }}>Metro linear (ML)</option></select></div><button class="btn">Cadastrar</button></form></div>
+<div class="card"><table><tr><th>Nome</th><th>Unidade padrão</th><th>Produtos</th><th>Situação</th><th></th></tr>
 {% for c in rows %}<tr><td><form method="post" action="{{ url_for('categoria_renomear', cid=c.id) }}" class="bar" style="margin:0;flex-wrap:nowrap"><input name="nome" value="{{ c.nome }}" maxlength="60" style="min-width:160px"><button class="btn sec sm">Renomear</button></form></td>
+<td><form method="post" action="{{ url_for('categoria_unidade', cid=c.id) }}" style="margin:0"><select name="unidade" onchange="this.form.submit()" style="width:auto"><option value="un" {{ 'selected' if c.unidade == 'un' else '' }}>Unitário (un)</option><option value="m2" {{ 'selected' if c.unidade == 'm2' else '' }}>m²</option><option value="ml" {{ 'selected' if c.unidade == 'ml' else '' }}>Metro linear (ML)</option></select></form></td>
 <td>{{ c.usos }}</td><td><span class="tag {{ 'ok' if c.ativo else '' }}">{{ 'ativa' if c.ativo else 'inativa' }}</span></td>
 <td class="n"><form class="inline" method="post" action="{{ url_for('categoria_ativar', cid=c.id) }}"><button class="btn sec sm">{{ 'Desativar' if c.ativo else 'Ativar' }}</button></form>
 {% if c.usos %}<form class="inline" method="post" action="{{ url_for('categoria_reclassificar', cid=c.id) }}" onsubmit="return confirm('Mover todos os produtos desta categoria para a categoria escolhida?')"><select name="destino" style="width:auto"><option value="">mover produtos para…</option>{% for d in rows if d.id != c.id and d.ativo %}<option value="{{ d.id }}">{{ d.nome }}</option>{% endfor %}</select> <button class="btn sec sm">Reclassificar</button></form>
 {% else %}<form class="inline" method="post" action="{{ url_for('categoria_excluir', cid=c.id) }}" onsubmit="return confirm('Excluir esta categoria?')"><button class="btn red sm">Excluir</button></form>{% endif %}</td></tr>{% endfor %}</table>
-<p class="hint">Renomear atualiza os produtos da categoria. Categoria em uso não pode ser excluída (reclassifique antes). Desativar só a tira da lista de novos cadastros.</p></div>
+<p class="hint">Renomear atualiza os produtos da categoria. Categoria em uso não pode ser excluída (reclassifique antes). Desativar só a tira da lista de novos cadastros. A unidade padrão (un, m² ou ML) é preenchida sozinha ao escolher a categoria num produto novo; os produtos já cadastrados não mudam.</p></div>
 {% endblock %}"""
 
 DUPLICIDADES = r"""{% extends "base.html" %}{% block conteudo %}
@@ -4424,8 +6443,8 @@ DUPLICIDADES = r"""{% extends "base.html" %}{% block conteudo %}
 IMPRIMIR = r"""{% macro tabela(linhas, comps, interna) %}
 <table class="it"><thead><tr><th class="q">Qtd.</th><th>Descrição</th><th class="m">Medidas</th><th class="v">Valor unit.</th><th class="v">Total</th></tr></thead><tbody>
 {% for l in linhas %}<tr><td class="q">{{ l.qtd }}</td><td><b>{{ l.nome }}</b>{% if l.descricao %} — {{ l.descricao }}{% endif %}{% if comps[l.id] %}<div class="sm">{% for c in comps[l.id] %}{{ c.categoria or c.descricao }}{% if c.categoria and c.descricao and c.descricao != c.categoria %} ({{ c.descricao }}){% endif %}{% if not loop.last %} · {% endif %}{% endfor %}</div>{% endif %}</td>
-<td class="m">{% if l.largura and l.altura %}{{ l.largura|num }} × {{ l.altura|num }} cm{% endif %}</td><td class="v">{{ l.valor_unit|brl }}</td><td class="v">{{ l.total|brl }}</td></tr>{% endfor %}</tbody></table>
-<div class="tot">{% if o.desconto %}<div>Subtotal: {{ subtotal|brl }}</div><div>Desconto{% if o.desconto_tipo == 'pct' %} ({{ o.desconto_valor|num(2) }}%){% endif %}: − {{ o.desconto|brl }}</div>{% endif %}<div class="gt">Total: {{ o.total|brl }}</div></div>
+<td class="m">{% if l.largura and l.altura %}{{ l.largura|num }} × {{ l.altura|num }} cm{% endif %}</td><td class="v">{{ l.valor_unit|brl }}</td><td class="v">{% if desc_l[l.id] %}<span style="text-decoration:line-through">{{ l.total|brl }}</span><div class="sm">desconto − {{ desc_l[l.id]|brl }}</div><b>{{ (l.total - desc_l[l.id])|brl }}</b>{% else %}{{ l.total|brl }}{% endif %}</td></tr>{% endfor %}</tbody></table>
+<div class="tot">{% if o.desconto %}<div>Subtotal: {{ subtotal|brl }}</div><div>Desconto{% if o.desconto_tipo == 'pct' %} ({{ o.desconto_valor|num(2) }}%){% endif %}: − {{ o.desconto|brl }}</div>{% endif %}<div class="gt">Total: {{ o.total|brl }}</div>{% if pag and pag.itens %}<div>Já pago: {{ pag.pago|brl }}</div><div><b>Saldo a pagar: {{ pag.saldo|brl }}</b></div>{% endif %}</div>
 {% if o.obs %}<div class="obs"><b>Observações:</b> {{ o.obs }}</div>{% endif %}
 {% endmacro %}
 {% macro dados(o, interna) %}
@@ -4465,7 +6484,7 @@ table.it{width:100%;border-collapse:collapse;font-size:9.5pt}
 .aviso{max-width:210mm;margin:0 auto 8px;font-size:13px;background:#fef3c7;padding:6px 10px;border-radius:6px}
 @media print{body{background:#fff}.bar,.aviso{display:none!important}.folha{width:auto;margin:0;padding:0;box-shadow:none}}
 </style></head><body>
-<div class="bar"><button type="button" onclick="window.print()">Imprimir</button><a class="s" href="{{ url_for('orcamento_ver', oid=o.id) }}">Voltar ao orçamento</a></div>
+<div class="bar"><button type="button" onclick="window.print()">Imprimir</button><button type="button" id="btnImg" style="background:#16a34a" onclick="copiarImagem(this)">📋 Copiar como imagem</button><span id="msgImg" style="font-size:13px"></span><a class="s" href="{{ url_for('orcamento_ver', oid=o.id) }}">Voltar ao orçamento</a></div>
 {% if modo == '2vias' and not cabe %}<div class="aviso">Orçamento longo: para não cortar nem reduzir demais a letra, cada via sai em uma folha A4.</div>{% endif %}
 <div class="folha {{ 'duas' if modo == '2vias' else '' }} {{ 'cabe' if cabe else '' }}">
 {% if modo == '2vias' %}
@@ -4476,6 +6495,43 @@ table.it{width:100%;border-collapse:collapse;font-size:9.5pt}
 <section class="via">{{ cabecalho(emp) }}<div class="tit">{{ 'ORDEM DE SERVIÇO' if modo == 'os' else 'ORÇAMENTO' }} Nº {{ '%04d'|format(o.id) }}</div>{{ dados(o, false) }}{{ tabela(linhas, comps, false) }}{% if emp.obs_inst or emp.rodape %}<div class="rod">{{ emp.obs_inst }}{% if emp.obs_inst and emp.rodape %} · {% endif %}{{ emp.rodape }}</div>{% endif %}</section>
 {% endif %}
 </div>
+<script>
+async function copiarImagem(btn){
+  const msg=document.getElementById('msgImg'), rot=btn.textContent;
+  const alvo=document.querySelector('.via1')||document.querySelector('.folha');
+  const nome='orcamento-{{ "%04d"|format(o.id) }}.png';
+  btn.disabled=true; btn.textContent='Gerando imagem...'; msg.textContent='';
+  try{
+    const larg=alvo.offsetWidth+24, clone=alvo.cloneNode(true);
+    for(const im of clone.querySelectorAll('img')){
+      const b=await (await fetch(im.src)).blob();
+      im.src=await new Promise(r=>{const f=new FileReader(); f.onload=()=>r(f.result); f.readAsDataURL(b);});
+    }
+    const css=Array.from(document.querySelectorAll('style')).map(s=>s.textContent).join('\n').replace(/&/g,'&amp;').replace(/</g,'&lt;');
+    const html=new XMLSerializer().serializeToString(clone);
+    const base='<div xmlns="http://www.w3.org/1999/xhtml" style="width:'+larg+'px;padding:12px;box-sizing:border-box;background:#fff;color:#000;font:10pt/1.3 Arial,Helvetica,sans-serif"><style>'+css+' .folha{width:auto!important;margin:0!important;padding:0!important;box-shadow:none!important}</style>';
+    // mede a altura real renderizando fora da tela
+    const med=document.createElement('div'); med.style.cssText='position:fixed;left:-99999px;top:0'; med.innerHTML=base+clone.outerHTML+'</div>'; document.body.appendChild(med);
+    const alt=med.firstChild.offsetHeight; document.body.removeChild(med);
+    const svg='<svg xmlns="http://www.w3.org/2000/svg" width="'+larg+'" height="'+alt+'"><foreignObject width="100%" height="100%">'+base+html+'</div></foreignObject></svg>';
+    const img=new Image(); img.src='data:image/svg+xml;charset=utf-8,'+encodeURIComponent(svg);
+    await img.decode();
+    const k=2, cv=document.createElement('canvas'); cv.width=larg*k; cv.height=alt*k;
+    const cx=cv.getContext('2d'); cx.fillStyle='#fff'; cx.fillRect(0,0,cv.width,cv.height); cx.drawImage(img,0,0,cv.width,cv.height);
+    const blob=await new Promise(r=>cv.toBlob(r,'image/png'));
+    if(!blob) throw new Error('sem imagem');
+    try{
+      await navigator.clipboard.write([new ClipboardItem({'image/png':blob})]);
+      msg.style.color='#15803d'; msg.textContent='✓ Copiado! Cole no WhatsApp com Ctrl+V.';
+    }catch(e){
+      const a=document.createElement('a'); a.href=URL.createObjectURL(blob); a.download=nome; document.body.appendChild(a); a.click(); a.remove();
+      msg.style.color='#b45309'; msg.textContent='Não consegui copiar direto; baixei a imagem ('+nome+'). Anexe no WhatsApp.';
+    }
+  }catch(e){
+    msg.style.color='#b91c1c'; msg.textContent='Não foi possível gerar a imagem: '+e;
+  }finally{btn.disabled=false; btn.textContent=rot;}
+}
+</script>
 {% if auto %}<script>window.addEventListener('load',function(){window.print();});</script>{% endif %}
 </body></html>"""
 
@@ -4605,6 +6661,13 @@ BANCOS = r"""{% extends "base.html" %}{% block head %}<style>
 <td class="n">{% if s.dif is not none %}<span class="{{ 'c' if s.dif == 0 else 'd' }}">{{ 'confere' if s.dif == 0 else s.dif|brl }}</span>{% else %}<span class="mut">—</span>{% endif %}</td></tr>{% endfor %}</table>
 <p class="nota">O saldo informado em {{ meses[mes - 1] }} será o saldo inicial de {{ mes_seg[5:] }}/{{ mes_seg[:4] }}. Para limpar um fechamento, salve o campo em branco.</p>
 {% else %}<p class="mut">Importe um extrato para controlar o saldo da conta.</p>{% endif %}</div>{% endif %}
+<div class="card" id="comparativo"><h2>Conferência: vendas × entradas do banco — {{ ano }}</h2>
+<p class="nota">Compara o que o sistema registra como <b>recebido de vendas</b> com tudo que <b>entrou nos bancos</b>. As entradas do banco incluem também Pix avulsos e repasses de marketplace, então a diferença não precisa ser zero: serve para ver se algum mês tem dinheiro entrando sem venda registrada (diferença positiva) ou venda marcada como recebida sem entrada no banco (negativa).</p>
+{% if comparativo %}<table><tr><th>Mês</th><th class="n">Vendas concluídas</th><th class="n">Recebido (sistema)</th><th class="n">A receber</th><th class="n">Entradas nos bancos</th><th class="n">Diferença (banco − recebido)</th></tr>
+{% for c in comparativo %}<tr><td>{{ meses[c.mes - 1] }}</td><td class="n">{{ c.vendas|brl }}</td><td class="n">{{ c.recebido|brl }}</td><td class="n">{{ c.areceber|brl }}</td>
+<td class="n">{% if c.tem_banco %}{{ c.banco|brl }}{% else %}<span class="mut">sem extrato</span>{% endif %}</td>
+<td class="n">{% if c.tem_banco %}<span class="{{ 'c' if c.dif >= 0 else 'd' }}">{{ c.dif|brl }}</span>{% else %}<span class="mut">—</span>{% endif %}</td></tr>{% endfor %}</table>
+{% else %}<p class="mut">Sem dados neste ano.</p>{% endif %}</div>
 <div class="card" id="movs"><h2>Movimentações{% if cat_nome %}<span class="chip">Categoria: <b>{{ cat_nome }}</b> · {{ (sub_ent or sub_sai)|brl }} <a href="{{ url_for('bancos', ano=ano, mes=mes, banco=banco) }}#movs">limpar ✕</a></span>{% endif %}</h2>{% if movs %}<table><tr><th>Data</th><th>Descrição</th><th>Categoria</th><th>Banco</th><th class="n">Valor</th></tr>
 {% for l in movs %}{% set det = l.detalhe.split('\n') if l.detalhe else [] %}<tr><td>{{ l.data|dia }}</td><td>{{ l.historico }}{% set nome = contraparte(det) %}{% if nome %} <span class="mut">— {{ nome }}</span>{% endif %}</td><td>{{ l.cat or '' }}</td><td>{{ l.banco }}</td>
 <td class="n {{ 'c' if l.acao == 'receita' else 'd' }}">{{ '+' if l.acao == 'receita' else '−' }} {{ l.valor|brl }}</td></tr>{% endfor %}</table>
@@ -4685,7 +6748,8 @@ VENDA_VER = r"""{% extends "base.html" %}{% block conteudo %}
 {% if v.status == 'ativa' %}<form class="inline" method="post" action="{{ url_for('venda_cancelar', vid=v.id) }}" onsubmit="return confirm('{{ 'Estornar a venda? O orçamento volta para Aprovado e o estoque continua baixado.' if v.orcamento_id else 'Cancelar a venda e devolver os produtos ao estoque?' }}')"><button class="btn red">{{ 'Estornar venda' if v.orcamento_id else 'Cancelar venda' }}</button></form>{% endif %}
 </div>
 {% if v.status == 'ativa' %}<div class="card"><h2>Recebimento</h2>
-{% if v.recebido_em %}<p>Recebido em <b>{{ v.recebido_em|dia }}</b>. <span class="mut">A receita desta venda já foi contada na conclusão; registrar o recebimento não soma de novo.</span></p>
+{% if pag and pag.itens %}<p>Recebido pelos pagamentos do serviço: <b>{{ pag.pago|brl }}</b> de {{ v.total|brl }}{% if pag.saldo %} · <b>saldo {{ pag.saldo|brl }}</b>{% endif %}. <a href="{{ url_for('orcamento_ver', oid=v.orcamento_id) }}#pagamentos">Ver / registrar pagamentos</a></p>
+{% elif v.recebido_em %}<p>Recebido em <b>{{ v.recebido_em|dia }}</b>. <span class="mut">A receita desta venda já foi contada na conclusão; registrar o recebimento não soma de novo.</span></p>
 <form method="post" action="{{ url_for('venda_recebimento', vid=v.id) }}"><input type="hidden" name="desfazer" value="1"><button class="btn sec sm">Desfazer recebimento</button></form>
 {% else %}<p class="mut">Esta venda conta como receita, mas ainda <b>não</b> consta como dinheiro recebido.</p>
 <form method="post" action="{{ url_for('venda_recebimento', vid=v.id) }}" class="bar" style="align-items:end"><div><label>Data do recebimento</label><input type="date" name="recebido_em" value="{{ hoje }}" style="width:170px"></div><button class="btn sm">Registrar recebimento</button></form>{% endif %}</div>{% endif %}
@@ -4732,7 +6796,426 @@ PRODUTO_MOV = r"""{% extends "base.html" %}{% block conteudo %}
 {% else %}<p class="mut">Nenhuma movimentação registrada ainda (as movimentações passam a ser registradas a partir desta versão).</p>{% endif %}</div>
 {% endblock %}"""
 
+BACKUPS = r"""{% extends "base.html" %}{% block conteudo %}
+<div class="cab"><div><h1>Backups</h1><span class="mut">O sistema salva uma cópia do banco de dados sozinho, uma vez por dia, na pasta <b>backups</b> (ao lado do gestao.db). Ficam guardadas as últimas {{ manter }}.</span></div>
+<form method="post" action="{{ url_for('backup_agora') }}"><button class="btn">Fazer backup agora</button></form></div>
+<div class="card"><h2>Cópia extra (opcional)</h2>
+<form method="post" action="{{ url_for('backup_config') }}" class="nv" style="display:flex;gap:8px;flex-wrap:wrap;align-items:end">
+<div style="flex:1;min-width:280px"><label>Pasta extra (ex.: pasta do Google Drive, OneDrive ou pendrive)</label><input name="pasta" value="{{ extra }}" placeholder="C:\Users\voce\Google Drive\Backups CIR" style="width:100%"></div><button class="btn">Salvar</button></form>
+{% if extra %}<p class="nota">Cada backup também é copiado para essa pasta (ficam as últimas {{ manter }} de cada tipo). {% if extra_ok %}<span class="tag ok">pasta encontrada</span>{% else %}<span class="tag er">pasta não encontrada</span>{% endif %}</p>
+{% if est.st.quando %}<p class="nota">Última cópia extra: {% if est.st.ok %}<span class="tag ok">ok</span> {{ est.st.quando[8:10] }}/{{ est.st.quando[5:7] }}/{{ est.st.quando[:4] }} {{ est.st.quando[11:] }} ({{ est.st.arquivo }}){% else %}<span class="tag er">falhou</span> {{ est.st.erro }}{% endif %}</p>{% else %}<p class="nota">Ainda não houve cópia extra. Clique em “Fazer backup agora” para testar.</p>{% endif %}
+<form method="post" action="{{ url_for('backup_testar') }}"><button class="btn sec sm">Testar a pasta</button></form>{% endif %}</div>
+<div class="card"><h2>Backups guardados</h2>{% if arqs %}<table><tr><th>Arquivo</th><th>Data</th><th class="n">Tamanho</th><th></th></tr>
+{% for a in arqs %}<tr><td>{{ a.nome }}</td><td>{{ a.data }}</td><td class="n">{{ a.kb }} KB</td><td class="n"><a class="btn sec sm" href="{{ url_for('backup_baixar', nome=a.nome) }}">Baixar</a></td></tr>{% endfor %}</table>
+{% else %}<p class="mut">Nenhum backup ainda.</p>{% endif %}</div>
+<div class="card"><h2>Como restaurar</h2><p class="nota">Feche o sistema, renomeie o <b>gestao.db</b> atual para <b>gestao_antigo.db</b>, copie o backup desejado para a pasta do sistema e renomeie para <b>gestao.db</b>. Abra o sistema de novo.</p></div>
+{% endblock %}
+"""
+
+CONTAS = r"""{% extends "base.html" %}{% block head %}<style>
+.ab{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px}.ab a{padding:5px 12px;border-radius:999px;border:1px solid var(--bd);background:#fff;color:inherit;text-decoration:none;font-size:13.5px}
+.ab a.on{background:#eff6ff;border-color:#bfdbfe;color:var(--pri);font-weight:600}
+.kp{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:12px;margin-bottom:14px}.kp .card{margin:0;padding:12px 16px}.kp small{color:var(--mut);display:block}.kp b{font-size:20px;font-variant-numeric:tabular-nums}
+.acoes{display:flex;gap:6px;justify-content:flex-end;align-items:center;flex-wrap:wrap}.acoes form{margin:0;display:flex;gap:6px;align-items:center}.acoes input[type=date]{width:auto;padding:4px 6px}
+.fnv{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:10px;align-items:end}
+.c{color:#15803d}.d{color:#b91c1c}
+</style>{% endblock %}{% block conteudo %}
+<div class="cab"><div><h1>Contas a pagar e a receber</h1><span class="mut">Tudo que ainda vai sair ou entrar, por vencimento. Ao dar baixa, o lançamento vira pago/recebido no Financeiro.</span></div></div>
+<div class="kp"><div class="card"><small>Vencidas</small><b class="d">{{ tot.vencidas|brl }}</b><small>{{ tot.n_vencidas }} conta(s)</small></div>
+<div class="card"><small>Vencem em 7 dias</small><b>{{ tot.semana|brl }}</b><small>{{ tot.n_semana }} conta(s)</small></div>
+<div class="card"><small>Total em aberto</small><b>{{ tot.aberto|brl }}</b><small>nesta lista</small></div></div>
+<div class="ab">{% for k, r in (('pagar','A pagar'),('receber','A receber'),('pagas','Pagas / recebidas')) %}<a class="{{ 'on' if aba == k else '' }}" href="{{ url_for('contas', aba=k) }}">{{ r }}</a>{% endfor %}
+{% if aba != 'pagas' %}<span style="flex:1"></span>{% for k, r in (('todas','Todas'),('vencidas','Vencidas'),('semana','Próx. 7 dias'),('mes','Este mês')) %}<a class="{{ 'on' if filtro == k else '' }}" href="{{ url_for('contas', aba=aba, filtro=k) }}">{{ r }}</a>{% endfor %}{% endif %}</div>
+<div class="card">{% if rows %}<table><tr><th>Vence</th><th>Descrição</th><th>Categoria</th><th class="n">Valor</th><th>Situação</th><th></th></tr>
+{% for r in rows %}<tr><td>{{ (r.venc or '')|dia }}</td>
+<td>{% if r.link %}<a href="{{ r.link }}">{{ r.descricao }}</a>{% else %}{{ r.descricao }}{% endif %}</td><td>{{ r.categoria or '' }}</td>
+<td class="n {{ 'c' if r.tipo == 'receita' else 'd' }}">{{ r.valor|brl }}</td>
+<td>{% if r.pago %}<span class="tag ok">{{ 'pago' if r.tipo == 'despesa' else 'recebido' }} {{ r.pago|dia }}</span>
+{% elif r.dias is none %}<span class="tag">sem vencimento</span>{% elif r.dias < 0 %}<span class="tag er">vencida há {{ -r.dias }} dia(s)</span>{% elif r.dias == 0 %}<span class="tag wa">vence hoje</span>{% else %}<span class="tag">em {{ r.dias }} dia(s)</span>{% endif %}</td>
+<td><div class="acoes">
+{% if r.origem == 'lancamento' %}{% if r.pago %}<form method="post" action="{{ url_for('conta_desfazer', lid=r.id) }}"><button class="btn ghost sm">Desfazer</button></form>
+{% else %}<form method="post" action="{{ url_for('conta_baixa', lid=r.id) }}"><input type="date" name="data" value="{{ hoje }}"><button class="btn sm">{{ 'Pagar' if r.tipo == 'despesa' else 'Receber' }}</button></form>
+<form method="post" action="{{ url_for('conta_excluir', lid=r.id) }}" onsubmit="return confirm('Excluir esta conta?')"><button class="btn red sm">Excluir</button></form>{% endif %}
+{% else %}<a class="btn sm" href="{{ r.link }}">Registrar recebimento</a>{% endif %}</div></td></tr>{% endfor %}</table>
+{% else %}<p class="mut">Nada por aqui.</p>{% endif %}</div>
+<div class="card"><h2>Nova conta</h2>
+<form method="post" action="{{ url_for('conta_nova') }}"><div class="fnv">
+<div><label>Tipo</label><select name="tipo" id="cTipo"><option value="despesa">A pagar (despesa)</option><option value="receita">A receber (receita)</option></select></div>
+<div style="grid-column:span 2"><label>Descrição</label><input name="descricao" maxlength="120" required placeholder="ex.: Aluguel, boleto fornecedor"></div>
+<div><label>Categoria</label><select name="categoria_id" id="cCat" required>{% for c in cats %}<option value="{{ c.id }}" data-tipo="{{ c.tipo }}">{{ c.nome }}</option>{% endfor %}</select></div>
+<div><label>Valor (R$)</label><input name="valor" inputmode="decimal" required placeholder="0,00"></div>
+<div><label>1º vencimento</label><input type="date" name="vencimento" value="{{ hoje }}" required></div>
+<div><label>Parcelas (mensais)</label><input type="number" name="parcelas" value="1" min="1" max="60"></div>
+<div><button class="btn">Adicionar</button></div></div>
+<p class="nota">Com mais de 1 parcela, o sistema cria uma conta por mês (mesmo dia), com o valor informado em cada uma.</p></form></div>
+<script>
+const t = document.getElementById('cTipo'), c = document.getElementById('cCat');
+function filtra() { let primeira = null; for (const o of c.options) { const ok = o.dataset.tipo === t.value; o.hidden = !ok; o.disabled = !ok; if (ok && !primeira) primeira = o; }
+  if (c.selectedOptions[0] && c.selectedOptions[0].disabled && primeira) c.value = primeira.value; }
+t.addEventListener('change', filtra); filtra();
+</script>
+{% endblock %}
+"""
+
+ENTREGAS = r"""{% extends "base.html" %}{% block head %}<style>
+.acoes{display:flex;gap:6px;justify-content:flex-end;flex-wrap:wrap}.acoes form{margin:0}.acoes .btn{white-space:nowrap}
+.wpp{background:#16a34a;color:#fff}.wpp:hover{background:#15803d}
+textarea.msg{width:100%;min-height:130px;font:inherit}
+</style>{% endblock %}{% block conteudo %}
+<div class="cab"><div><h1>Entregas</h1><span class="mut">Serviços aprovados ou em produção, por data de entrega. A data é definida no orçamento (campo “Entrega prevista”).</span></div></div>
+<div class="card">{% if rows %}<table><tr><th>Entrega</th><th>Serviço</th><th>Cliente</th><th>Situação</th><th class="n">Saldo</th><th></th></tr>
+{% for r in rows %}<tr><td>{% if r.entrega %}{{ r.entrega|dia }}{% else %}<span class="mut">sem data</span>{% endif %}</td>
+<td><a href="{{ url_for('orcamento_ver', oid=r.id) }}">#{{ r.id }}</a> <span class="mut">{{ r.titulo or '' }}</span></td>
+<td>{{ r.cliente }}<br><span class="mut" style="font-size:12.5px">{{ r.telefone or 'sem telefone' }}</span></td>
+<td>{% if r.dias is none %}<span class="tag">sem data</span>{% elif r.dias < 0 %}<span class="tag er">atrasado {{ -r.dias }} dia(s)</span>{% elif r.dias == 0 %}<span class="tag wa">entrega hoje</span>{% elif r.dias == 1 %}<span class="tag wa">amanhã</span>{% else %}<span class="tag">em {{ r.dias }} dias</span>{% endif %}
+ <span class="tag {{ 'ok' if r.status == 'concluido' else '' }}">{{ ORC[r.status][0] }}</span>{% if r.pronto_enviado_em %} <span class="tag ok" title="Aviso de pronto enviado">avisado {{ r.pronto_enviado_em|dt }}</span>{% endif %}</td>
+<td class="n">{{ r.saldo|brl }}</td>
+<td><div class="acoes">
+{% if r.num %}<form method="post" action="{{ url_for('pronto_enviar', oid=r.id) }}" target="_blank"><button class="btn sm wpp">💬 {{ 'Avisar de novo' if r.pronto_enviado_em else 'Avisar que está pronto' }}</button></form>{% endif %}
+{% if r.status != 'concluido' %}<form method="post" action="{{ url_for('orcamento_status', oid=r.id) }}"><input type="hidden" name="status" value="concluido"><button class="btn sec sm" title="Marca como concluído / entregue">Concluir</button></form>{% endif %}
+</div></td></tr>{% endfor %}</table>
+{% else %}<p class="mut">Nenhum serviço em andamento.</p>{% endif %}</div>
+<div class="card"><h2>Mensagem “pronto para retirada”</h2>
+<form method="post" action="{{ url_for('pronto_config') }}">
+<textarea class="msg" name="msg" maxlength="600">{{ modelo }}</textarea>
+<p class="nota">Use <b>{nome}</b>, <b>{empresa}</b>, <b>{os}</b> e <b>{saldo}</b> (vira “Saldo a pagar na retirada: R$ …” ou “Pagamento já quitado.”).</p>
+<button class="btn">Salvar mensagem</button></form></div>
+{% endblock %}
+"""
+
+RELATORIOS = r"""{% extends "base.html" %}{% block head %}<style>
+.fl{display:flex;gap:10px;align-items:end;flex-wrap:wrap;margin-bottom:14px}.fl select,.fl input{width:auto}.fl label{margin:0 0 3px}
+.c{color:#15803d}.d{color:#b91c1c}
+</style>{% endblock %}{% block conteudo %}
+<div class="cab"><div><h1>Relatórios</h1><span class="mut">O que vende mais, o que dá mais lucro e quem não volta há tempo. Só conta venda concluída.</span></div><a class="btn sec" href="{{ url_for('exportar') }}">📤 Exportar para o contador</a></div>
+<form method="get" class="fl"><div><label>Mês</label><select name="mes"><option value="0">Ano todo</option>{% for m in meses %}<option value="{{ loop.index }}"{{ ' selected' if loop.index == mes else '' }}>{{ m }}</option>{% endfor %}</select></div>
+<div><label>Ano</label><input type="number" name="ano" value="{{ ano }}" min="2000" max="2100" style="width:96px"></div>
+<div><label>Cliente inativo após (dias)</label><input type="number" name="dias" value="{{ dias }}" min="15" max="1000" style="width:110px"></div><button class="btn sec">Atualizar</button></form>
+<div class="card"><h2>Produtos e materiais mais vendidos</h2>
+{% if prods %}<table><tr><th>Produto</th><th class="n">Quantidade</th><th class="n">Receita</th><th class="n">Custo</th><th class="n">Margem</th><th class="n">Margem %</th></tr>
+{% for p in prods %}<tr><td>{{ p.nome }}</td><td class="n">{{ p.qtd|num(2) }}</td><td class="n">{{ p.receita|brl }}</td>
+<td class="n">{% if p.custo is not none %}{{ p.custo|brl }}{% else %}<span class="mut">sem custo</span>{% endif %}</td>
+<td class="n">{% if p.custo is not none %}<span class="{{ 'c' if p.margem >= 0 else 'd' }}">{{ p.margem|brl }}</span>{% else %}—{% endif %}</td>
+<td class="n">{% if p.custo is not none and p.receita %}{{ ('%.0f'|format(p.margem * 100 / p.receita)) }}%{% else %}—{% endif %}</td></tr>{% endfor %}</table>
+<p class="nota">Receita = preço dos componentes no orçamento, antes de descontos. Custo = preço de custo cadastrado na hora da venda. “Sem custo” = produto sem custo cadastrado (não é contado como zero).</p>
+{% else %}<p class="mut">Sem vendas no período.</p>{% endif %}</div>
+<div class="row2"><div class="card"><h2>Melhores clientes</h2>
+{% if clientes %}<table><tr><th>Cliente</th><th class="n">Compras</th><th class="n">Total</th><th class="n">Ticket médio</th></tr>
+{% for c in clientes %}<tr><td><a href="{{ url_for('cliente_ver', cid=c.id) }}">{{ c.nome }}</a></td><td class="n">{{ c.n }}</td><td class="n">{{ c.total|brl }}</td><td class="n">{{ (c.total // c.n)|brl }}</td></tr>{% endfor %}</table>
+{% else %}<p class="mut">Sem vendas no período.</p>{% endif %}</div>
+<div class="card"><h2>Clientes que não voltam há {{ dias }}+ dias</h2>
+{% if inativos %}<table><tr><th>Cliente</th><th>Última compra</th><th class="n">Total já comprado</th><th></th></tr>
+{% for c in inativos %}<tr><td><a href="{{ url_for('cliente_ver', cid=c.id) }}">{{ c.nome }}</a><br><span class="mut" style="font-size:12.5px">{{ c.telefone or 'sem telefone' }}</span></td><td>{{ c.ultima|dia }} <span class="mut">({{ c.dias_sem }} dias)</span></td><td class="n">{{ c.total|brl }}</td>
+<td class="n">{% if c.wa %}<a class="btn sm" style="background:#16a34a" target="_blank" href="{{ c.wa }}">💬 Chamar</a>{% endif %}</td></tr>{% endfor %}</table>
+<p class="nota">O botão abre o WhatsApp com uma mensagem de reaproximação; nada é enviado sem você apertar enviar.</p>
+{% else %}<p class="mut">Nenhum cliente nessa situação.</p>{% endif %}</div></div>
+{% endblock %}
+"""
+
+COMPRAS = r"""{% extends "base.html" %}{% block head %}<style>
+td input[type=number]{width:100px;text-align:right}
+@media print{.noprint{display:none!important}}
+</style>{% endblock %}{% block conteudo %}
+<div class="cab"><div><h1>Lista de compras</h1><span class="mut">Produtos com estoque no mínimo, abaixo dele ou negativo. A quantidade sugerida leva o estoque a <b>2× o mínimo</b> (ou cobre o que está faltando); ajuste como quiser.</span></div>
+<div class="bar noprint"><button class="btn sec" id="bCopiar">Copiar lista</button><a class="btn" id="bWpp" target="_blank" style="background:#16a34a" href="#">💬 Enviar por WhatsApp</a><button class="btn sec" onclick="window.print()">🖨 Imprimir</button></div></div>
+{% if rows %}<div class="card"><table id="tb"><tr><th class="noprint"></th><th>Produto</th><th>Código</th><th class="n">Estoque</th><th class="n">Mínimo</th><th class="n">Comprar</th><th>Un.</th><th class="n">Custo unit.</th><th class="n">Estimado</th></tr>
+{% for p in rows %}<tr data-nome="{{ p.nome }}" data-un="{{ p.unidade|ul }}" data-custo="{{ p.custo or 0 }}">
+<td class="noprint"><input type="checkbox" class="ck" checked></td><td>{{ p.nome }}</td><td>{{ p.sku or '' }}</td>
+<td class="n {{ 'd' if p.estoque < 0 else '' }}" {% if p.estoque < 0 %}style="color:#b91c1c"{% endif %}>{{ p.estoque|num(3) }}</td><td class="n">{{ p.estoque_min|num(3) }}</td>
+<td class="n"><input type="number" class="qt" step="any" min="0" value="{{ p.sugerida|num(3) }}"></td><td>{{ p.unidade|ul }}</td>
+<td class="n">{{ p.custo|brl if p.custo else '—' }}</td><td class="n est">—</td></tr>{% endfor %}
+<tr><td class="noprint"></td><td colspan="7" class="n"><b>Total estimado</b></td><td class="n"><b id="tot">—</b></td></tr></table>
+<p class="nota">O estimado usa o custo cadastrado de cada produto; produto sem custo fica fora da soma.</p></div>
+{% else %}<div class="card"><p class="mut">Nenhum produto precisa de reposição agora. 👍</p></div>{% endif %}
+<script>
+const brl = c => 'R$ ' + (c / 100).toFixed(2).replace('.', ',').replace(/\B(?=(\d{3})+(?!\d))/g, '.');
+const fmt = n => String(Math.round(n * 1000) / 1000).replace('.', ',');
+function recalcula() {
+  let tot = 0;
+  document.querySelectorAll('#tb tr[data-nome]').forEach(tr => {
+    const q = parseFloat(tr.querySelector('.qt').value) || 0, c = parseInt(tr.dataset.custo) || 0;
+    const sub = Math.round(q * c); tr.querySelector('.est').textContent = c ? brl(sub) : '—';
+    if (tr.querySelector('.ck').checked) tot += sub;
+  });
+  document.getElementById('tot') && (document.getElementById('tot').textContent = brl(tot));
+  const linhas = [];
+  document.querySelectorAll('#tb tr[data-nome]').forEach(tr => {
+    const q = parseFloat(tr.querySelector('.qt').value) || 0;
+    if (tr.querySelector('.ck').checked && q > 0) linhas.push('- ' + tr.dataset.nome + ': ' + fmt(q) + ' ' + tr.dataset.un);
+  });
+  window.TEXTO = 'Lista de compras - {{ empresa }}\n' + linhas.join('\n');
+  document.getElementById('bWpp') && (document.getElementById('bWpp').href = 'https://wa.me/?text=' + encodeURIComponent(window.TEXTO));
+}
+document.querySelectorAll('#tb .qt, #tb .ck').forEach(e => e.addEventListener('input', recalcula));
+document.getElementById('bCopiar') && document.getElementById('bCopiar').addEventListener('click', async () => {
+  try { await navigator.clipboard.writeText(window.TEXTO); alert('Lista copiada.'); } catch (e) { prompt('Copie a lista:', window.TEXTO); } });
+recalcula();
+</script>
+{% endblock %}
+"""
+
+EXPORTAR = r"""{% extends "base.html" %}{% block conteudo %}
+<div class="cab"><div><h1>Exportar para o contador</h1><span class="mut">Gera um arquivo .zip com planilhas (CSV) que abrem direto no Excel: vendas, financeiro, movimento dos bancos, pagamentos de serviços e um resumo.</span></div></div>
+<div class="card"><form method="get" action="{{ url_for('exportar_baixar') }}" style="display:flex;gap:10px;align-items:end;flex-wrap:wrap">
+<div><label>Mês</label><select name="mes" style="width:auto"><option value="0">Ano todo</option>{% for m in meses %}<option value="{{ loop.index }}"{{ ' selected' if loop.index == mes else '' }}>{{ m }}</option>{% endfor %}</select></div>
+<div><label>Ano</label><input type="number" name="ano" value="{{ ano }}" min="2000" max="2100" style="width:96px"></div>
+<button class="btn">⬇ Baixar .zip</button></form>
+<p class="nota" style="margin-top:12px">Dentro do .zip: <b>vendas.csv</b>, <b>financeiro.csv</b> (receitas e despesas lançadas), <b>bancos.csv</b> (extratos importados, separados do financeiro), <b>pagamentos_servicos.csv</b> e <b>resumo.csv</b> (DRE do período). Valores em reais com vírgula; separador de colunas “;”.</p></div>
+{% endblock %}
+"""
+
+LOGIN = r"""<!doctype html><html lang="pt-br"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Entrar — {{ empresa }}</title>
+<style>*{box-sizing:border-box}body{margin:0;min-height:100vh;display:grid;place-items:center;background:#f3f4f6;font-family:system-ui,-apple-system,"Segoe UI",sans-serif;color:#0f172a}
+.box{background:#fff;border:1px solid #e2e8f0;border-radius:14px;padding:28px;width:min(380px,92vw);box-shadow:0 10px 30px #0001}
+h1{font-size:20px;margin:0 0 4px}p{color:#64748b;margin:0 0 16px;font-size:14px}label{display:block;font-size:13px;color:#64748b;margin:10px 0 4px}
+input[type=password]{width:100%;padding:10px 12px;border:1px solid #cbd5e1;border-radius:8px;font-size:16px}
+button{margin-top:16px;width:100%;padding:11px;border:0;border-radius:8px;background:#2563eb;color:#fff;font-size:16px;cursor:pointer}
+.erro{background:#fee2e2;color:#7f1d1d;padding:9px 12px;border-radius:8px;font-size:14px;margin-bottom:10px}.chk{display:flex;gap:8px;align-items:center;margin-top:12px;font-size:13.5px;color:#475569}</style></head>
+<body><form class="box" method="post"><h1>{{ empresa }}</h1><p>Digite a senha para entrar no sistema.</p>
+{% for cat, msg in get_flashed_messages(with_categories=true) %}<div class="erro">{{ msg }}</div>{% endfor %}
+<input type="hidden" name="next" value="{{ proximo }}"><label>Senha</label><input type="password" name="senha" autofocus autocomplete="current-password" required>
+<label class="chk"><input type="checkbox" name="manter" value="1"> Manter conectado neste computador por 30 dias</label>
+<button>Entrar</button></form></body></html>
+"""
+
+SEGURANCA = r"""{% extends "base.html" %}{% block conteudo %}
+<div class="cab"><div><h1>Segurança</h1><span class="mut">Senha opcional para abrir o sistema. Sem senha, qualquer pessoa que abra o endereço neste computador vê tudo.</span></div></div>
+<div class="card"><h2>Senha de acesso: {% if tem_senha %}<span class="tag ok">ativada</span>{% else %}<span class="tag">desativada</span>{% endif %}</h2>
+<form method="post" action="{{ url_for('seguranca_salvar') }}" style="max-width:420px">
+{% if tem_senha %}<label>Senha atual</label><input type="password" name="atual" autocomplete="current-password" required>{% endif %}
+<label>{{ 'Nova senha' if tem_senha else 'Criar senha' }} (mínimo 4 caracteres)</label><input type="password" name="nova" autocomplete="new-password" minlength="4" required>
+<label>Repita a senha</label><input type="password" name="nova2" autocomplete="new-password" minlength="4" required>
+<div class="bar" style="margin-top:12px"><button class="btn">{{ 'Trocar senha' if tem_senha else 'Ativar senha' }}</button></div></form></div>
+{% if tem_senha %}<div class="card"><h2>Desativar a senha</h2><form method="post" action="{{ url_for('seguranca_remover') }}" style="max-width:420px">
+<label>Senha atual</label><input type="password" name="atual" required><div class="bar" style="margin-top:12px"><button class="btn red">Remover senha</button></div></form></div>
+<div class="card"><h2>Esqueci a senha</h2><p class="nota">Feche o sistema, crie um arquivo de texto vazio chamado <b>REMOVER_SENHA.txt</b> na mesma pasta do <b>gestao.db</b> e abra o sistema de novo: a senha é removida (e o arquivo apagado). Seus dados não são afetados.</p></div>{% endif %}
+{% endblock %}
+"""
+
+MARKETPLACES_HTML = r"""{% extends "base.html" %}{% block head %}<style>
+.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:12px;margin-bottom:14px}
+.cards .card{margin:0}.cards b{display:block;font-size:1.4em;margin-top:4px}
+.barra{background:var(--borda,#e5e7eb);border-radius:6px;height:10px;min-width:90px}.barra i{display:block;height:10px;border-radius:6px;background:#2563eb}
+</style>{% endblock %}{% block conteudo %}
+<div class="cab"><div><h1>Marketplaces</h1><span class="mut">Overview das vendas por loja e lucro por produto, importados dos relatórios do UpSeller (“Vendas loja performance” e “Vendas por Produtos”). Fica separado do Financeiro e do DRE para não duplicar receita.</span></div></div>
+<div class="bar" style="margin:0 0 12px;justify-content:space-between"><div class="bar" style="margin:0"><a class="btn {{ '' if aba=='geral' else 'sec' }}" href="/marketplaces">Visão geral</a><a class="btn {{ '' if aba=='lucro' else 'sec' }}" href="/marketplaces?aba=lucro">Produtos e lucro</a><a class="btn {{ '' if aba=='ranking' else 'sec' }}" href="/marketplaces?aba=ranking">Ranking</a></div><a class="btn sec" href="/marketplaces/dados">⬆ Importar relatórios e catálogo</a></div>
+{% if aba == 'lucro' %}{% include "mkt_lucro.html" %}{% elif aba == 'ranking' %}{% include "mkt_ranking.html" %}{% elif not periodos and not (dia and dia.meses) %}<div class="card"><p class="mut">Nenhum relatório importado ainda.</p></div>{% else %}
+<div class="card"><h2>{{ 'Faturamento e lucro por mês' if aba == 'lucro' else 'Vendas válidas por mês' }}</h2><div id="gLeg" class="bar" style="margin:0 0 6px;gap:14px"></div><div id="gMes" style="position:relative"></div>
+<p class="nota" id="gNota"></p><details><summary class="nota">Ver como tabela</summary><div id="gTab" style="overflow:auto"></div></details></div>
+{% if dia and dia.dados %}<div class="card"><div class="bar" style="margin:0 0 6px;justify-content:space-between"><h2 style="margin:0">Vendas por dia</h2>
+<form method="get" class="bar" style="margin:0"><select name="dm" onchange="this.form.submit()">{% for m in dia.meses %}<option value="{{ m.mes }}" {% if m.mes == dia.sel %}selected{% endif %}>{{ m.rot }}</option>{% endfor %}</select></form></div>
+<p class="nota" style="margin:0 0 6px">{{ dia.resumo }}</p><div id="gDiaLeg" class="bar" style="margin:0 0 6px;gap:14px"></div><div id="gDia" style="position:relative"></div>
+<p class="nota" id="gDiaNota"></p><details><summary class="nota">Ver como tabela</summary><div id="gDiaTab" style="overflow:auto"></div></details></div>{% endif %}
+{% if periodos %}
+<div class="card bar"><form method="get" class="bar" style="margin:0"><label style="margin:0">Período</label><select name="p" onchange="this.form.submit()">
+{% for p in periodos %}<option value="{{ p.ini }}|{{ p.fim }}" {% if p.ini == ini and p.fim == fim %}selected{% endif %}>{{ p.ini|dia }} a {{ p.fim|dia }}</option>{% endfor %}</select></form>
+<form method="post" action="/marketplaces/excluir" style="margin:0" onsubmit="return confirm('Excluir os números deste período?')"><input type="hidden" name="ini" value="{{ ini }}"><input type="hidden" name="fim" value="{{ fim }}"><button class="btn red sm">Excluir período</button></form></div>
+<div class="cards">
+<div class="card">Vendas válidas<b>{{ t.valor_validos|brl }}</b>{% if ant %}<span class="nota">{{ '%+.1f'|format(var) }}% vs. período anterior{% endif %}</span></div>
+<div class="card">Pedidos válidos<b>{{ t.validos }}</b></div>
+<div class="card">Ticket médio<b>{{ ticket|brl }}</b></div>
+<div class="card">Cancelamentos<b>{{ t.cancelados }}</b><span class="nota">{{ t.valor_cancelados|brl }} · {{ '%.1f'|format(taxa) }}% dos pedidos</span></div>
+</div>
+<div class="card"><h2>Por loja</h2><table><tr><th>Loja</th><th>Plataforma</th><th class="n">Pedidos válidos</th><th class="n">Vendas válidas</th><th class="n">Ticket médio</th><th class="n">Cancelados</th><th class="n">Cancel. (R$)</th><th>Participação</th></tr>
+{% for r in lojas %}<tr><td>{{ r.loja }}</td><td>{{ r.plataforma }}</td><td class="n">{{ r.validos }}</td><td class="n">{{ r.valor_validos|brl }}</td><td class="n">{{ (r.valor_validos // r.validos if r.validos else 0)|brl }}</td><td class="n">{{ r.cancelados }}</td><td class="n">{{ r.valor_cancelados|brl }}</td>
+<td><div class="barra"><i style="width:{{ r.pct }}%"></i></div><span class="nota">{{ '%.1f'|format(r.pct) }}%</span></td></tr>{% endfor %}
+<tr><td colspan="2"><b>Total</b></td><td class="n"><b>{{ t.validos }}</b></td><td class="n"><b>{{ t.valor_validos|brl }}</b></td><td class="n"><b>{{ ticket|brl }}</b></td><td class="n"><b>{{ t.cancelados }}</b></td><td class="n"><b>{{ t.valor_cancelados|brl }}</b></td><td></td></tr></table>
+<p class="nota">“Válidas” exclui pedidos cancelados. Total bruto do período (com cancelados): {{ t.valor|brl }} em {{ t.pedidos }} pedidos.</p></div>
+<div class="card"><h2>Histórico de períodos importados</h2><table><tr><th>Período</th><th class="n">Pedidos válidos</th><th class="n">Vendas válidas</th><th class="n">Cancelados</th></tr>
+{% for h in historico %}<tr><td><a href="/marketplaces?p={{ h.ini }}|{{ h.fim }}">{{ h.ini|dia }} a {{ h.fim|dia }}</a></td><td class="n">{{ h.validos }}</td><td class="n">{{ h.valor_validos|brl }}</td><td class="n">{{ h.cancelados }}</td></tr>{% endfor %}</table>
+<p class="nota">Períodos diferentes não são somados entre si, pois podem se sobrepor.</p></div>
+{% endif %}{% endif %}
+<script type="application/json" id="dMes">{{ mensal|tojson }}</script>
+{% if dia and dia.dados %}<script type="application/json" id="dDia">{{ dia.dados|tojson }}</script>{% endif %}
+<script>
+function desenha(D, el, leg, nota, tab) {
+  if (!el) return;
+  const brl = c => 'R$ ' + (c / 100).toFixed(2).replace('.', ',').replace(/\B(?=(\d{3})+(?!\d))/g, '.');
+  const curto = c => { const v = c / 100; return Math.abs(v) >= 1000 ? 'R$ ' + (v / 1000).toFixed(v % 1000 ? 1 : 0).replace('.', ',') + ' mil' : 'R$ ' + Math.round(v); };
+  if (!D.meses.length) { el.innerHTML = '<p class="mut">' + D.vazio + '</p>'; return; }
+  const cores = ['#2563eb', '#f59e0b', '#059669', '#7c3aed', '#dc2626', '#0891b2'];
+  const S = D.series.map((n, i) => ({n, c: D.cores ? D.cores[i] : cores[i % cores.length]}));
+  leg.innerHTML = S.length > 1 ? S.map(s => '<span style="display:inline-flex;align-items:center;gap:6px"><i style="width:10px;height:10px;border-radius:3px;background:' + s.c + '"></i>' + s.n + '</span>').join('') : '';
+  const W = 720, H = 270, L = 70, R = 12, T = 12, B = 34, pw = W - L - R, ph = H - T - B, M = D.meses, n = M.length;
+  const tot = m => D.modo === 'stack' ? m.vals.reduce((a, b) => a + Math.max(b, 0), 0) : Math.max(...m.vals, 0);
+  let mx = Math.max(...M.map(tot), 1); const pas = Math.pow(10, Math.floor(Math.log10(mx / 4))); const passo = Math.ceil(mx / 4 / pas) * pas; mx = passo * 4;
+  const mn = D.modo === 'stack' ? 0 : Math.min(0, ...M.flatMap(m => m.vals)); const lo = mn < 0 ? -Math.ceil(-mn / passo) * passo : 0; const span = mx - lo;
+  const y = v => T + ph - (v - lo) / span * ph, bw = Math.min(64, pw / n * 0.6);
+  let s = '<svg viewBox="0 0 ' + W + ' ' + H + '" style="width:100%;height:auto;max-height:320px" role="img" aria-label="Gráfico por mês">';
+  for (let v = lo; v <= mx + 1; v += passo) s += '<line x1="' + L + '" x2="' + (W - R) + '" y1="' + y(v) + '" y2="' + y(v) + '" stroke="currentColor" stroke-opacity=".15"/><text x="' + (L - 8) + '" y="' + (y(v) + 4) + '" text-anchor="end" font-size="11" fill="currentColor" fill-opacity=".7">' + curto(v) + '</text>';
+  M.forEach((m, k) => {
+    const cx = L + pw / n * (k + .5); let g = '<g class="gb" data-k="' + k + '">';
+    if (D.modo === 'stack') { let acc = 0; m.vals.forEach((v, i) => { if (v <= 0) return; const h = v / span * ph; g += '<rect x="' + (cx - bw / 2) + '" y="' + (y(acc + v) + 1) + '" width="' + bw + '" height="' + Math.max(h - 2, 1) + '" rx="3" fill="' + S[i].c + '"/>'; acc += v; }); }
+    else { const w = bw / m.vals.length; m.vals.forEach((v, i) => { const y0 = y(0), y1 = y(v); g += '<rect x="' + (cx - bw / 2 + i * w + 1) + '" y="' + Math.min(y0, y1) + '" width="' + (w - 2) + '" height="' + Math.max(Math.abs(y1 - y0), 1) + '" rx="3" fill="' + S[i].c + '"/>'; }); }
+    g += '<rect x="' + (cx - pw / n / 2) + '" y="' + T + '" width="' + pw / n + '" height="' + ph + '" fill="transparent"/></g>';
+    s += g + ((k % (D.passoRot || 1)) ? '' : '<text x="' + cx + '" y="' + (H - 12) + '" text-anchor="middle" font-size="12" fill="currentColor" fill-opacity=".8">' + m.rot + (m.parcial ? '*' : '') + '</text>');
+  });
+  el.innerHTML = s + '</svg><div class="gTip" style="position:absolute;display:none;pointer-events:none;background:#111827;color:#fff;border-radius:8px;padding:8px 10px;font-size:12px;line-height:1.5;z-index:5;white-space:nowrap"></div>';
+  const tip = el.querySelector('.gTip');
+  el.querySelectorAll('.gb').forEach(g => {
+    const m = M[g.dataset.k];
+    g.addEventListener('mousemove', e => {
+      const r = el.getBoundingClientRect();
+      tip.innerHTML = '<b>' + m.rot + (m.parcial ? ' (parcial até ' + m.ate + ')' : '') + '</b><br>' + S.map((x, i) => '<span style="color:' + x.c + '">●</span> ' + x.n + ': ' + brl(m.vals[i])).join('<br>') + (D.modo === 'stack' && S.length > 1 ? '<br><b>Total: ' + brl(tot(m)) + '</b>' : '');
+      tip.style.display = 'block'; tip.style.left = Math.min(e.clientX - r.left + 14, r.width - 190) + 'px'; tip.style.top = (e.clientY - r.top + 14) + 'px';
+    });
+    g.addEventListener('mouseleave', () => tip.style.display = 'none');
+  });
+  nota.textContent = M.some(m => m.parcial) ? '* mês parcial: o relatório importado não cobre o mês inteiro. ' + (D.aviso || '') : (D.aviso || '');
+  tab.innerHTML = '<table><tr><th>Mês</th>' + S.map(s => '<th class="n">' + s.n + '</th>').join('') + '</tr>' + M.map(m => '<tr><td>' + m.rot + (m.parcial ? '*' : '') + '</td>' + m.vals.map(v => '<td class="n">' + brl(v) + '</td>').join('') + '</tr>').join('') + '</table>';
+}
+desenha(JSON.parse(document.getElementById('dMes').textContent), document.getElementById('gMes'), document.getElementById('gLeg'), document.getElementById('gNota'), document.getElementById('gTab'));
+(function () { const d = document.getElementById('dDia'); if (d) desenha(JSON.parse(d.textContent), document.getElementById('gDia'), document.getElementById('gDiaLeg'), document.getElementById('gDiaNota'), document.getElementById('gDiaTab')); })();
+</script>{% endblock %}"""
+
+MKT_LUCRO_HTML = r"""{% if not lp %}<div class="card"><p class="mut">Nenhum relatório “Vendas por Produtos” importado ainda. No UpSeller exporte o relatório de vendas por produtos e importe acima.</p></div>{% else %}
+<div class="card bar" style="margin:0 0 12px"><form method="get" class="bar" style="margin:0"><input type="hidden" name="aba" value="lucro"><label style="margin:0">Período</label><select name="p" onchange="this.form.submit()">
+{% for p in lp %}<option value="{{ p.ini }}|{{ p.fim }}" {% if p.ini == ini and p.fim == fim %}selected{% endif %}>{{ p.ini|dia }} a {{ p.fim|dia }}</option>{% endfor %}</select></form>
+<form method="post" action="/marketplaces/excluir-produtos" style="margin:0" onsubmit="return confirm('Excluir os produtos deste período? Custos e taxas cadastrados continuam salvos.')"><input type="hidden" name="ini" value="{{ ini }}"><input type="hidden" name="fim" value="{{ fim }}"><button class="btn red sm">Excluir período</button></form></div>
+<div class="card"><h2>{{ 'Faturamento e lucro por mês' if aba == 'lucro' else 'Vendas válidas por mês' }}</h2><div id="gLeg" class="bar" style="margin:0 0 6px;gap:14px"></div><div id="gMes" style="position:relative"></div>
+<p class="nota" id="gNota"></p><details><summary class="nota">Ver como tabela</summary><div id="gTab" style="overflow:auto"></div></details></div>
+<div class="cards" style="grid-template-columns:repeat(auto-fit,minmax(150px,1fr))">
+{% macro variacao(a,b) %}{% if b %}{% set v = (a - b) * 100.0 / b %}<span class="nota" style="color:{{ '#15803d' if v >= 0 else '#b91c1c' }}">{{ '▲' if v >= 0 else '▼' }} {{ '%.1f'|format(v|abs) }}%</span>{% else %}<span class="nota">&nbsp;</span>{% endif %}{% endmacro %}
+<div class="card">Faturamento{{ variacao(T.receita, A.receita if A else 0) }}<b>{{ T.receita|brl }}</b></div>
+<div class="card">Preço de custo{{ variacao(T.custo, A.custo if A else 0) }}<b>{{ T.custo|brl }}</b></div>
+<div class="card">Comissão da plataforma{{ variacao(T.comissao, A.comissao if A else 0) }}<b>{{ T.comissao|brl }}</b></div>
+<div class="card">Impostos{{ variacao(T.imposto, A.imposto if A else 0) }}<b>{{ T.imposto|brl }}</b></div>
+<div class="card">Lucro{{ variacao(T.lucro, A.lucro if A else 0) }}<b style="color:{{ '#15803d' if T.lucro >= 0 else '#b91c1c' }}">{{ T.lucro|brl }}</b></div>
+<div class="card">Margem<b>{{ '%.1f'|format(T.margem) }}%</b><span class="nota">lucro ÷ faturamento</span></div>
+<div class="card">Markup<b>{{ '%.1f'|format(T.markup) if T.custo else '—' }}{{ '%' if T.custo else '' }}</b><span class="nota">lucro ÷ custo</span></div>
+</div>
+<p class="nota">Fonte dos dados deste período: {{ 'relatório de vendas por variante (cada variação com custo próprio)' if T.fonte_var else 'relatório de vendas por produto' }}.</p>
+{% if T.sem_custo %}<div class="flash erro" style="margin-bottom:12px">{{ T.sem_custo }} produto(s) sem custo cadastrado — o lucro está <b>superestimado</b> até você preencher o custo abaixo.</div>{% endif %}
+{% if T.n_abaixo %}<div class="flash erro" style="margin-bottom:12px">⚠ {{ T.n_abaixo }} produto(s) estão sendo vendidos <b>abaixo do preço mínimo</b> para a margem de {{ T.margem_alvo }}%. Veja a coluna “Preço mín.” em vermelho.</div>{% endif %}
+{% if A %}<p class="nota">Comparação com o período anterior ({{ A.ini|dia }} a {{ A.fim|dia }}), usando os mesmos custos e taxas de hoje.</p>{% endif %}
+<div class="card"><h2>Margem desejada</h2><p class="nota">Preço mínimo = custo ÷ (1 − comissão − imposto − margem). É o menor preço de venda que ainda deixa essa margem de lucro, loja por loja.</p>
+<label style="margin:0">Margem desejada sobre o preço de venda (%)</label> <input id="margemAlvo" value="{{ T.margem_alvo }}" inputmode="decimal" style="width:80px;text-align:right"></div>
+<div class="card"><h2>Taxas por loja (%)</h2><p class="nota">Digite a comissão da plataforma e o imposto de cada loja; salva ao sair do campo. Os valores se aplicam sobre o faturamento de cada produto.</p>
+<table><tr><th>Loja</th><th class="n">Comissão da plataforma (%)</th><th class="n">Imposto (%)</th><th class="n">Faturamento</th></tr>
+{% for l in lojas_t %}<tr><td>{{ l.loja }}</td><td class="n"><input class="tx" data-loja="{{ l.loja }}" data-campo="comissao" value="{{ l.comissao }}" inputmode="decimal" style="width:80px;text-align:right"></td>
+<td class="n"><input class="tx" data-loja="{{ l.loja }}" data-campo="imposto" value="{{ l.imposto }}" inputmode="decimal" style="width:80px;text-align:right"></td><td class="n">{{ l.receita|brl }}</td></tr>{% endfor %}</table></div>
+{% if ex.sem_vinc and ex.opcoes %}<div class="card"><h2>Sem vínculo com o catálogo ({{ ex.sem_vinc|length }})</h2>
+<p class="nota">Estas vendas não bateram com nenhum produto do catálogo (nem por ID do anúncio, nem por SKU). Escolha a qual produto padrão cada uma pertence; a escolha fica salva para os próximos relatórios.</p>
+<div class="bar" style="margin:0 0 10px"><button class="btn sm" id="bSug">Aceitar todas as sugestões</button></div>
+<table><tr><th>Venda</th><th>Loja</th><th>SKU / ID</th><th class="n">Faturamento</th><th>Produto padrão</th></tr>
+{% for f in ex.sem_vinc %}<tr><td style="max-width:300px">{{ f.produto }}</td><td>{{ f.loja }}</td><td>{{ f.sku or f.anuncio }}</td><td class="n">{{ f.valor|brl }}</td>
+<td><select class="vn" data-origem="{{ f.origem }}" data-sug="{{ f.sugestao }}" style="max-width:280px"><option value="">— manter separado —</option>
+{% for o in ex.opcoes %}<option value="{{ o.chave }}" {% if o.chave == f.sugestao %}selected{% endif %}>{{ o.nome }}{{ ' (SKU ' ~ o.chave ~ ')' if not o.chave.startswith('id:') else '' }}</option>{% endfor %}</select>
+{% if f.sugestao %}<span class="nota">sugestão — confirme</span>{% endif %}</td></tr>{% endfor %}</table></div>{% endif %}
+<div class="card"><h2>Produtos</h2><p class="nota">Variações e lojas do mesmo produto padrão aparecem somadas numa linha. O custo da linha do produto é o <b>padrão</b> (se o SKU já está em Produtos com custo, ele vem preenchido). Clique em ▸ para ver as variações e dar a cada uma o seu custo, quando o tamanho ou modelo muda o preço; a variação sem custo próprio usa o padrão. Variação terminada em vírgula e número (ex.: “Roxo Lavanda,5”) é pacote de quantidade: o custo informado é o de <b>1 peça</b> e o sistema multiplica pela quantidade. “Excluir” tira o produto desta lista e dos totais (dá para restaurar no fim da página).</p>
+<div style="overflow:auto"><table><tr><th>Produto</th><th>Lojas</th><th class="n">Unid.</th><th class="n">Faturamento</th><th class="n">Preço médio</th><th class="n" title="Preço mínimo para dar a margem desejada, descontando custo, comissão e imposto">Preço mín. ({{ T.margem_alvo }}%)</th><th class="n">Custo unit. (R$)</th><th class="n">Custo</th><th class="n">Comissão</th><th class="n">Imposto</th><th class="n">Lucro</th><th class="n">Margem</th><th></th></tr>
+{% for r in prods %}<tr class="pai" data-k="{{ r.chave }}"><td style="max-width:340px">{% if r.fontes|length > 1 %}<button class="btn sec sm tg" data-k="{{ r.chave }}" title="Ver variações">▸ {{ r.fontes|length }}</button> {% endif %}<b>{{ r.produto }}</b><br><span class="nota">{{ 'SKU ' ~ r.sku if r.sku else 'sem SKU' }}{{ '' if r.padrao else ' · fora do catálogo' }}{{ ' · custos diferentes nas variações' if r.varia else '' }}</span></td>
+<td>{{ r.lojas|join(', ') }}</td><td class="n">{{ r.unidades }}</td><td class="n">{{ r.valor|brl }}</td>
+<td class="n">{{ r.preco_atual|brl }}</td><td class="n" style="{{ 'color:#b91c1c;font-weight:600' if r.abaixo else '' }}">{{ (r.preco_min|brl ~ (' ⚠' if r.abaixo else '')) if r.preco_min else '—' }}</td>
+<td class="n"><input class="cu" title="Custo padrão do produto: vale para as variações que não tiverem custo próprio" data-chave="{{ r.chave }}" value="{{ r.custo_fmt }}" placeholder="0,00" inputmode="decimal" style="width:80px;text-align:right{{ ';border-color:#dc2626' if r.falta_custo and not r.custo_unit else '' }}"></td>
+<td class="n">{{ r.custo|brl }}</td><td class="n">{{ r.comissao|brl }}</td><td class="n">{{ r.imposto|brl }}</td><td class="n" style="color:{{ '#15803d' if r.lucro >= 0 else '#b91c1c' }}">{{ r.lucro|brl }}</td><td class="n">{{ '%.1f'|format(r.margem) }}%</td>
+<td><button class="btn red sm bx" data-chave="{{ r.chave }}" data-nome="{{ r.produto[:50] }}">Excluir</button></td></tr>
+{% if r.fontes|length > 1 %}{% for f in r.fontes %}<tr class="vr" data-p="{{ r.chave }}" style="display:none;background:rgba(127,127,127,.08)"><td style="padding-left:28px;max-width:340px">↳ {{ f.rotulo }}<br><span class="nota">{{ f.sub }}</span></td>
+<td>{{ f.loja }}</td><td class="n">{{ f.unidades }}</td><td class="n">{{ f.valor|brl }}</td>
+<td class="n">{{ f.preco_atual|brl }}</td><td class="n" style="{{ 'color:#b91c1c;font-weight:600' if f.abaixo else '' }}">{{ (f.preco_min|brl ~ (' ⚠' if f.abaixo else '')) if f.preco_min else '—' }}</td>
+<td class="n"><input class="cu" title="Custo desta variação. Vazio = usa o custo padrão do produto" data-chave="{{ f.custo_chave }}" value="{{ f.custo_fmt }}" placeholder="{{ f.custo_herdado or '0,00' }}" inputmode="decimal" style="width:80px;text-align:right{{ ';border-color:#dc2626' if not f.custo_unit else '' }}">{% if f.qtd > 1 %}<br><span class="nota">× {{ f.qtd }} = {{ f.custo_unit|brl }} por venda</span>{% endif %}</td>
+<td class="n">{{ f.custo|brl }}</td><td class="n">{{ f.comissao|brl }}</td><td class="n">{{ f.imposto|brl }}</td><td class="n" style="color:{{ '#15803d' if f.lucro >= 0 else '#b91c1c' }}">{{ f.lucro|brl }}</td><td class="n">{{ '%.1f'|format(f.margem) }}%</td><td></td></tr>{% endfor %}{% endif %}{% endfor %}
+</table></div></div>
+{% if ex.ignorados %}<div class="card"><h2>Excluídos ({{ ex.ignorados|length }})</h2><table>{% for x in ex.ignorados %}<tr><td>{{ x.nome }}</td><td class="n">{{ x.valor|brl }}</td><td><button class="btn sec sm br" data-chave="{{ x.chave }}">Restaurar</button></td></tr>{% endfor %}</table></div>{% endif %}
+<script>
+async function salvaMkt(url, corpo) {
+  const r = await fetch(url, {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(corpo)});
+  const j = await r.json();
+  if (!j.ok) { alert((j.erros || ['Erro']).join('\n')); return; }
+  location.reload();
+}
+function abertos() { try { return JSON.parse(localStorage.getItem('mktAb') || '[]'); } catch (e) { return []; } }
+function mostra(k, v) { document.querySelectorAll('.vr').forEach(r => { if (r.dataset.p === k) r.style.display = v ? '' : 'none'; }); }
+document.querySelectorAll('.tg').forEach(b => {
+  if (abertos().includes(b.dataset.k)) { mostra(b.dataset.k, true); b.textContent = b.textContent.replace('▸', '▾'); }
+  b.addEventListener('click', () => {
+    const k = b.dataset.k, ab = abertos(), on = !ab.includes(k);
+    mostra(k, on); b.textContent = b.textContent.replace(on ? '▸' : '▾', on ? '▾' : '▸');
+    try { localStorage.setItem('mktAb', JSON.stringify(on ? ab.concat(k) : ab.filter(x => x !== k))); } catch (e) {}
+  });
+});
+document.querySelectorAll('.cu').forEach(e => e.addEventListener('change', () => salvaMkt('/api/marketplaces/custo', {chave: e.dataset.chave, custo: e.value})));
+document.querySelectorAll('.vn').forEach(e => e.addEventListener('change', () => salvaMkt('/api/marketplaces/vinculo', {origem: e.dataset.origem, grupo: e.value})));
+document.querySelectorAll('.bx').forEach(e => e.addEventListener('click', () => { if (confirm('Excluir "' + e.dataset.nome + '" desta lista e dos totais? Dá para restaurar depois.')) salvaMkt('/api/marketplaces/excluir', {chave: e.dataset.chave}); }));
+document.querySelectorAll('.br').forEach(e => e.addEventListener('click', () => salvaMkt('/api/marketplaces/excluir', {chave: e.dataset.chave, restaurar: true})));
+const bs = document.getElementById('bSug');
+if (bs) bs.addEventListener('click', () => { const pares = [...document.querySelectorAll('.vn')].filter(e => e.dataset.sug).map(e => ({origem: e.dataset.origem, grupo: e.dataset.sug})); if (pares.length) salvaMkt('/api/marketplaces/vinculo', {pares}); else alert('Sem sugestões.'); });
+const ma = document.getElementById('margemAlvo'); if (ma) ma.addEventListener('change', () => salvaMkt('/api/marketplaces/margem', {valor: ma.value}));
+document.querySelectorAll('.tx').forEach(e => e.addEventListener('change', () => salvaMkt('/api/marketplaces/taxa', {loja: e.dataset.loja, campo: e.dataset.campo, valor: e.value})));
+</script>
+{% endif %}
+"""
+
+MKT_DADOS_HTML = r"""{% extends "base.html" %}{% block conteudo %}
+<div class="cab"><div><h1>Importar relatórios e catálogo</h1><span class="mut">Relatórios do UpSeller para a página Marketplaces.</span></div><a class="btn sec" href="/marketplaces">← Voltar</a></div>
+<div class="card"><h2>Importar relatório do UpSeller</h2>
+<form method="post" action="/marketplaces/importar" enctype="multipart/form-data" class="bar" style="flex-wrap:wrap;align-items:end">
+<div><label>Arquivo Excel (.xlsx)</label><input type="file" name="arquivo" accept=".xlsx" required></div>
+<div><label>Início (se o nome do arquivo não trouxer)</label><input type="date" name="ini"></div>
+<div><label>Fim</label><input type="date" name="fim"></div>
+<button class="btn">Importar</button></form>
+<p class="nota">O sistema reconhece sozinho se é o relatório por loja ou por produto. O período é lido do nome do arquivo (ex.: …20261001-20261025…). Importar de novo o mesmo período substitui os números, sem duplicar.</p></div>
+
+<div class="card"><h2>Catálogo de referência</h2>
+<p class="nota">Importe a planilha dos seus produtos (a exportação de produtos da Shopee/UpSeller com “ID do Produto” e “SKU de referência”). Cada SKU vira o <b>produto padrão</b>: variações e anúncios das outras lojas (pelo ID do anúncio ou pelo SKU) são somados numa venda única. A descrição não é usada.</p>
+<div class="bar" style="margin:0;align-items:center"><span><b>{{ n_cat }}</b> anúncio(s) no catálogo</span>{% if n_cat %}<form method="post" action="/marketplaces/limpar-catalogo" style="margin:0" onsubmit="return confirm('Remover o catálogo e os vínculos manuais?')"><button class="btn red sm">Remover catálogo</button></form>{% endif %}</div></div>
+<div class="card"><h2>Relatórios já importados</h2>
+{% if not resumo %}<p class="mut">Nada importado ainda.</p>{% else %}<table><tr><th>Tipo</th><th>Período</th><th class="n">Linhas</th></tr>
+{% for r in resumo %}<tr><td>{{ r.tipo }}</td><td>{{ r.ini|dia }} a {{ r.fim|dia }}</td><td class="n">{{ r.n }}</td></tr>{% endfor %}</table>{% endif %}</div>
+{% endblock %}
+"""
+
+MKT_RANKING_HTML = r"""{% if not lp %}<div class="card"><p class="mut">Importe um relatório “Vendas por Produtos” ou “Vendas por variante” para ver o ranking.</p></div>{% else %}
+<div class="card bar" style="margin:0 0 12px"><form method="get" class="bar" style="margin:0"><input type="hidden" name="aba" value="ranking"><label style="margin:0">Período</label><select name="p" onchange="this.form.submit()">
+{% for p in lp %}<option value="{{ p.ini }}|{{ p.fim }}" {% if p.ini == ini and p.fim == fim %}selected{% endif %}>{{ p.ini|dia }} a {{ p.fim|dia }}</option>{% endfor %}</select></form></div>
+{% if rk.sem_custo %}<div class="flash erro" style="margin-bottom:12px">{{ rk.sem_custo }} produto(s) sem custo cadastrado entram no ranking como se o custo fosse zero, então o lucro deles aparece maior do que é. Preencha os custos em <a href="/marketplaces?aba=lucro&p={{ ini }}|{{ fim }}">Produtos e lucro</a>.</div>{% endif %}
+{% macro tabela(lista, vazio) %}{% if lista %}<div style="overflow:auto"><table><tr><th>Produto</th><th>Lojas</th><th class="n">Unid.</th><th class="n">Faturamento</th><th class="n">Lucro</th><th class="n">Margem</th></tr>
+{% for r in lista %}<tr><td style="max-width:360px">{{ r.produto }}<br><span class="nota">{{ 'SKU ' ~ r.sku if r.sku else 'sem SKU' }}</span></td><td>{{ r.lojas|join(', ') }}</td><td class="n">{{ r.unidades }}</td><td class="n">{{ r.valor|brl }}</td>
+<td class="n" style="color:{{ '#15803d' if r.lucro >= 0 else '#b91c1c' }}">{{ r.lucro|brl }}</td><td class="n">{{ '%.1f'|format(r.margem) }}%</td></tr>{% endfor %}</table></div>{% else %}<p class="mut">{{ vazio }}</p>{% endif %}{% endmacro %}
+<div class="card"><h2>🏆 Mais lucrativos</h2>{{ tabela(rk.top, 'Sem dados.') }}</div>
+<div class="card"><h2>⚠️ Dão prejuízo</h2>{{ tabela(rk.prejuizo, 'Nenhum produto com prejuízo neste período. 👍') }}</div>
+<div class="card"><h2>🐌 Vendem muito, rendem pouco</h2><p class="nota">Entre os 15 que mais faturam, os que têm margem abaixo da média do período ({{ '%.1f'|format(rk.margem_media) }}%).</p>{{ tabela(rk.baixa, 'Nenhum dos mais vendidos está abaixo da média.') }}</div>
+{% if rk.variacoes %}<div class="card"><h2>🎨 Variações mais vendidas</h2><table><tr><th>Variação</th><th>Produto</th><th>Loja</th><th class="n">Unid.</th><th class="n">Faturamento</th><th class="n">Margem</th></tr>
+{% for f in rk.variacoes %}<tr><td>{{ f.rotulo }}</td><td style="max-width:260px">{{ f.pai }}</td><td>{{ f.loja }}</td><td class="n">{{ f.unidades }}</td><td class="n">{{ f.valor|brl }}</td><td class="n">{{ '%.1f'|format(f.margem) }}%</td></tr>{% endfor %}</table></div>{% endif %}
+{% endif %}
+"""
+
+FOLLOWUP_HTML = r"""{% extends "base.html" %}{% block conteudo %}
+<div class="cab"><div><h1>Orçamentos parados</h1><span class="mut">Orçamentos (ainda não aprovados) sem resposta. Envie um lembrete pelo WhatsApp: o sistema abre a conversa com a mensagem pronta e registra que você lembrou o cliente.</span></div></div>
+<div class="bar" style="margin:0 0 12px">{% for k, rot in [('pendentes','Para lembrar'),('lembrados','Já lembrados'),('dispensados','Não lembrar'),('todos','Todos abertos')] %}<a class="btn {{ '' if aba == k else 'sec' }} sm" href="{{ url_for('followup', aba=k) }}">{{ rot }} ({{ cont[k] }})</a>{% endfor %}</div>
+<div class="card">{% if rows %}<table><tr><th>#</th><th>Cliente</th><th>Peça</th><th class="n">Valor</th><th>Parado há</th><th>Último lembrete</th><th></th></tr>
+{% for r in rows %}<tr><td><a href="{{ url_for('orcamento_ver', oid=r.id) }}">{{ r.id }}</a></td><td>{{ r.cliente }}<br><span class="nota">{{ r.telefone or 'sem telefone' }}</span></td><td>{{ r.titulo or '' }}</td><td class="n">{{ r.total|brl }}</td>
+<td>{{ r.dias }} dia(s)</td><td>{% if r.followup_em %}{{ r.followup_em|dt }}{% else %}<span class="mut">—</span>{% endif %}</td>
+<td class="n" style="white-space:nowrap">
+<form class="inline" method="post" target="_blank" action="{{ url_for('followup_enviar', oid=r.id) }}"><button class="btn sm" style="background:#16a34a" {{ '' if numero_whatsapp(r.telefone) else 'disabled title="Cliente sem telefone válido"' }}>💬 Lembrar</button></form>
+<form class="inline" method="post" action="{{ url_for('followup_estado', oid=r.id) }}"><input type="hidden" name="acao" value="lembrado"><button class="btn sec sm" title="Já falei com o cliente por outro meio">Já falei</button></form>
+{% if r.followup_off %}<form class="inline" method="post" action="{{ url_for('followup_estado', oid=r.id) }}"><input type="hidden" name="acao" value="pendente"><button class="btn sec sm">Voltar</button></form>
+{% else %}<form class="inline" method="post" action="{{ url_for('followup_estado', oid=r.id) }}"><input type="hidden" name="acao" value="dispensar"><button class="btn sec sm">Não lembrar</button></form>{% endif %}</td></tr>{% endfor %}</table>
+{% else %}<p class="mut">{{ 'Nenhum orçamento parado. 👍' if aba == 'pendentes' else 'Nada por aqui.' }}</p>{% endif %}</div>
+<div class="card"><h2>Configuração</h2>
+<form method="post" action="{{ url_for('followup_config') }}">
+<label>Considerar parado depois de quantos dias</label><input name="dias" value="{{ dias }}" inputmode="numeric" style="width:90px">
+<p class="nota">Conta a partir da data do orçamento e, depois de um lembrete, a partir do lembrete.</p>
+<label>Mensagem</label><textarea name="msg" rows="5" style="width:100%">{{ modelo }}</textarea>
+<p class="nota">Use {nome} (primeiro nome do cliente), {empresa}, {os} (número do orçamento) e {valor} (total).</p>
+<button class="btn">Salvar</button></form></div>
+{% endblock %}
+"""
+
 app.jinja_loader = DictLoader({
+    "followup.html": FOLLOWUP_HTML,
+    "mkt_ranking.html": MKT_RANKING_HTML,
+    "mkt_dados.html": MKT_DADOS_HTML,
+    "mkt_lucro.html": MKT_LUCRO_HTML,
+    "marketplaces.html": MARKETPLACES_HTML,
+    "seguranca.html": SEGURANCA,
+    "login.html": LOGIN,
+    "exportar.html": EXPORTAR,
+    "compras.html": COMPRAS,
+    "relatorios.html": RELATORIOS,
+    "entregas.html": ENTREGAS,
+    "contas.html": CONTAS,
+    "backups.html": BACKUPS,
     "base.html": BASE, "dashboard.html": DASHBOARD, "financeiro.html": FINANCEIRO, "empresa.html": EMPRESA, "categorias.html": CATEGORIAS, "imprimir.html": IMPRIMIR, "avaliacoes.html": AVALIACOES, "bancos.html": BANCOS, "bancos_categorias.html": BANCOS_CAT, "extrato_envio.html": EXTRATO_ENVIO, "extrato_ver.html": EXTRATO_VER, "duplicidades.html": DUPLICIDADES, "clientes.html": CLIENTES,
     "cliente_ver.html": CLIENTE_VER, "cliente_form.html": CLIENTE_FORM,
     "produtos.html": PRODUTOS, "produto_form.html": PRODUTO_FORM, "produto_mov.html": PRODUTO_MOV,
@@ -4743,6 +7226,8 @@ app.jinja_loader = DictLoader({
 })
 
 iniciar_db()
+carregar_segredo()
+
 
 def _porta_ocupada(porta=5000):
     import socket
